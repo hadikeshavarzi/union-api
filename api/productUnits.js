@@ -1,7 +1,9 @@
 // api/productUnits.js
 const express = require("express");
 const { supabaseAdmin } = require("../supabaseAdmin");
-const { authMiddleware } = require("./middleware/auth");
+
+// 👇 اصلاح شد: حذف {} و اصلاح مسیر به ../middleware/auth
+const authMiddleware = require("./middleware/auth");
 
 const router = express.Router();
 

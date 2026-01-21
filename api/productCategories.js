@@ -1,7 +1,11 @@
 // api/productCategories.js
 const express = require("express");
 const { supabaseAdmin } = require("../supabaseAdmin");
-const { authMiddleware } = require("./middleware/auth");
+
+// 👇 اصلاح شد: حذف {} (حیاتی!)
+// اگر فایل auth.js داخل پوشه api/middleware است، همین مسیر درست است.
+// اگر فایل auth.js در روت پروژه (middleware/) است، باید ../middleware/auth باشد.
+const authMiddleware = require("./middleware/auth");
 
 const router = express.Router();
 
@@ -102,7 +106,7 @@ router.get("/:id", async (req, res) => {
 });
 
 /* =====================================================================
-   CREATE CATEGORY (Protected)
+   CREATE CATEGORY (Protected) 🔒
 ===================================================================== */
 router.post("/", authMiddleware, async (req, res) => {
     try {
@@ -145,7 +149,7 @@ router.post("/", authMiddleware, async (req, res) => {
 });
 
 /* =====================================================================
-   UPDATE CATEGORY (Protected)
+   UPDATE CATEGORY (Protected) 🔒
 ===================================================================== */
 router.put("/:id", authMiddleware, async (req, res) => {
     try {
@@ -182,7 +186,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 });
 
 /* =====================================================================
-   PATCH CATEGORY (Protected)
+   PATCH CATEGORY (Protected) 🔒
 ===================================================================== */
 router.patch("/:id", authMiddleware, async (req, res) => {
     try {
@@ -211,7 +215,7 @@ router.patch("/:id", authMiddleware, async (req, res) => {
 });
 
 /* =====================================================================
-   DELETE CATEGORY (Protected)
+   DELETE CATEGORY (Protected) 🔒
 ===================================================================== */
 router.delete("/:id", authMiddleware, async (req, res) => {
     try {

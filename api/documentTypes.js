@@ -2,7 +2,7 @@
 
 const express = require("express");
 const { supabaseAdmin } = require("../supabaseAdmin");
-const { authMiddleware } = require("./middleware/auth"); // ✅ اضافه شد
+const  authMiddleware  = require("./middleware/auth"); // ✅ اضافه شد
 const router = express.Router();
 
 /* ============================================================
