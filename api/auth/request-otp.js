@@ -1,6 +1,6 @@
 // api/auth/request-otp.js (CommonJS)
 const express = require("express");
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const { pool, supabaseAdmin } = require("../../supabaseAdmin");
 const axios = require("axios");
 
 const router = express.Router();

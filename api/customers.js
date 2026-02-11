@@ -1,316 +1,361 @@
-// api/customers.js - COMPLETE & FIXED FOR INTEGER IDs
 const express = require("express");
-const { supabaseAdmin } = require("../supabaseAdmin");
-const authMiddleware = require("./middleware/auth");
-
 const router = express.Router();
+const { pool } = require("../supabaseAdmin");
+const authMiddleware = require("./middleware/auth");
 
 const TAFSILI_TABLE = "accounting_tafsili";
 
-/* ============================================================
-   Helper: تبدیل UUID به عدد (جلوگیری از کرش)
-   ✅ حیاتی برای حل مشکل Invalid Syntax for Integer
-============================================================ */
-async function getNumericMemberId(idInput) {
-    if (!idInput) return null;
+// ============================================================
+// Helpers
+// ============================================================
 
-    // اگر ورودی از قبل عدد است
-    if (!isNaN(idInput) && !String(idInput).includes("-")) {
-        return Number(idInput);
-    }
+const isUUID = (s) =>
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-5][0-9a-f]{3}-[089ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(s || ""));
 
-    // اگر UUID است، از دیتابیس پیدا کن
-    const { data, error } = await supabaseAdmin
-        .from('members')
-        .select('id')
-        .eq('auth_user_id', idInput)
-        .maybeSingle();
+const toUUID = (id) => {
+  if (id === undefined || id === null || id === "") return null;
+  const s = String(id).trim();
+  if (isUUID(s)) return s;
+  if (/^\d+$/.test(s)) return `00000000-0000-0000-0000-${s.padStart(12, "0")}`;
+  return s; // اگر چیز دیگری بود همان را برگردان تا در validate گیر کنیم
+};
 
-    if (error) {
-        console.error("❌ DB Error in getNumericMemberId:", error.message);
-        return null;
-    }
-
-    return data ? data.id : null;
+function logQuery(label, sql, params) {
+  const safeParams = (params || []).map((v) => {
+    if (v === null || v === undefined) return v;
+    const s = String(v);
+    if (s.length > 80) return `${s.slice(0, 80)}…`;
+    return v;
+  });
+  console.log(`🧩 [${label}] SQL:\n${sql.trim()}`);
+  console.log(`🧩 [${label}] PARAMS:`, safeParams);
 }
 
-/* ============================================================
-   Helper: تولید کد تفصیلی جدید (برای مشتریان)
-============================================================ */
-async function generateNextTafsiliCode(memberId) {
-    try {
-        const { data: lastRecord } = await supabaseAdmin
-            .from(TAFSILI_TABLE)
-            .select("code")
-            .eq("member_id", memberId)
-            .eq("tafsili_type", "customer")
-            .lt('code', '999999') // فقط کدهای سیستمی کمتر از 6 رقم
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+function getMemberIdFromReq(req) {
+  // به ترتیب اولویت
+  const raw =
+    req?.user?.member_id ??
+    req?.user?.memberId ??
+    req?.user?.member ??
+    req?.headers?.["x-member-id"] ??
+    null;
 
-        let nextNum = 1;
-        if (lastRecord && lastRecord.code && !isNaN(Number(lastRecord.code))) {
-            nextNum = Number(lastRecord.code) + 1;
-        }
-        return String(nextNum).padStart(4, "0");
-    } catch (e) {
-        console.error("❌ Code Gen Error:", e);
-        return "0001";
-    }
+  const memberId = toUUID(raw);
+  if (!memberId || !isUUID(memberId)) return null;
+  return memberId;
 }
 
-/* ============================================================
-   GET CUSTOMERS (لیست مشتریان)
-============================================================ */
-router.get("/", authMiddleware, async (req, res) => {
-    try {
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2; // Fallback
+const asyncHandler = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
 
-        const { limit = 1000, offset = 0, search } = req.query;
+async function generateNextTafsiliCode(memberId, client) {
+  try {
+    const sql = `
+      SELECT COALESCE(MAX(code::int), 0) AS max_code
+      FROM ${TAFSILI_TABLE}
+      WHERE member_id = $1
+        AND tafsili_type = 'customer'
+        AND code ~ '^[0-9]+$'
+    `;
+    const res = await client.query(sql, [memberId]);
+    const max = Number(res.rows[0]?.max_code || 0);
+    return String(max + 1).padStart(4, "0");
+  } catch (e) {
+    console.error("❌ Code Gen Error:", e.message);
+    return "0001";
+  }
+}
 
-        let query = supabaseAdmin
-            .from("customers")
-            .select("*", { count: "exact" })
-            .eq("member_id", member_id) // ✅ استفاده از آیدی عددی
-            .order("created_at", { ascending: false });
+// ============================================================
+// Routes
+// ============================================================
 
-        if (search) {
-            query = query.or(`name.ilike.%${search}%,mobile.ilike.%${search}%,national_id.ilike.%${search}%`);
-        }
-
-        query = query.range(Number(offset), Number(offset) + Number(limit) - 1);
-        const { data, error, count } = await query;
-
-        if (error) throw error;
-        return res.json({ success: true, data, total: count });
-    } catch (e) {
-        console.error("❌ GET Customers Error:", e.message);
-        return res.status(500).json({ success: false, error: e.message });
+// 1) لیست مشتریان
+router.get(
+  "/",
+  authMiddleware,
+  asyncHandler(async (req, res) => {
+    const member_id = getMemberIdFromReq(req);
+    if (!member_id) {
+      return res.status(401).json({
+        success: false,
+        error: "member_id معتبر در توکن یافت نشد",
+      });
     }
-});
 
-/* ============================================================
-   GET ONE (جزئیات مشتری)
-============================================================ */
-router.get("/:id", authMiddleware, async (req, res) => {
-    try {
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
+    const { search } = req.query;
 
-        const { data, error } = await supabaseAdmin
-            .from("customers")
-            .select("*")
-            .eq("id", req.params.id)
-            .eq("member_id", member_id)
-            .single();
+    let sql = `
+      SELECT *
+      FROM public.customers
+      WHERE member_id = $1
+    `;
+    const params = [member_id];
 
-        if (error || !data) return res.status(404).json({ success: false, error: "Not Found" });
-        return res.json({ success: true, data });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+    if (search && String(search).trim()) {
+      sql += ` AND (name ILIKE $2 OR mobile ILIKE $2 OR national_id ILIKE $2)`;
+      params.push(`%${String(search).trim()}%`);
     }
-});
 
-/* ============================================================
-   📌 CREATE CUSTOMER + TAFSILI
-   ساخت همزمان مشتری و حساب تفصیلی متصل
-============================================================ */
-router.post("/", authMiddleware, async (req, res) => {
+    sql += ` ORDER BY created_at DESC LIMIT 500`;
+
+    logQuery("GET /customers", sql, params);
+    const { rows } = await pool.query(sql, params);
+
+    return res.status(200).json({
+      success: true,
+      data: rows || [],
+      count: (rows || []).length,
+    });
+  })
+);
+
+// 2) دریافت مشتری تکی
+router.get(
+  "/:id",
+  authMiddleware,
+  asyncHandler(async (req, res) => {
+    const member_id = getMemberIdFromReq(req);
+    if (!member_id) {
+      return res.status(401).json({ success: false, error: "member_id معتبر نیست" });
+    }
+
+    const id = req.params.id;
+    if (!id) {
+      return res.status(400).json({ success: false, error: "id الزامی است" });
+    }
+
+    const sql = `SELECT * FROM public.customers WHERE id = $1 AND member_id = $2`;
+    const { rows } = await pool.query(sql, [id, member_id]);
+
+    if (!rows.length) {
+      return res.status(404).json({ success: false, error: "مشتری یافت نشد" });
+    }
+
+    return res.json({ success: true, data: rows[0] });
+  })
+);
+
+// 3) ثبت مشتری جدید + ایجاد تفصیلی
+router.post(
+  "/",
+  authMiddleware,
+  asyncHandler(async (req, res) => {
+    const client = await pool.connect();
     try {
-        // ۱. دریافت آیدی عددی کاربر
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
+      const member_id = getMemberIdFromReq(req);
+      if (!member_id) {
+        return res.status(401).json({ success: false, error: "member_id معتبر نیست" });
+      }
 
-        const body = req.body;
-        const name = body.name || body.full_name;
-        const mobile = body.mobile;
+      const { name, mobile, national_id, address, customer_type, birth_or_register_date } = req.body || {};
 
-        console.log(`🚀 Creating Customer: ${name} for Member ID: ${member_id}`);
+      if (!name || !String(name).trim()) {
+        return res.status(400).json({ success: false, error: "نام مشتری الزامی است" });
+      }
 
-        if (!name || !mobile) {
-            return res.status(400).json({ success: false, error: "نام و موبایل الزامی است" });
+      await client.query("BEGIN");
+
+      // چک تکراری موبایل
+      if (mobile) {
+        const check = await client.query(
+          "SELECT id FROM public.customers WHERE mobile = $1 AND member_id = $2 LIMIT 1",
+          [mobile, member_id]
+        );
+        if (check.rows.length > 0) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "این شماره موبایل قبلاً ثبت شده است" });
         }
+      }
 
-        // ۲. چک تکراری بودن موبایل
-        const { data: existMobile } = await supabaseAdmin
-            .from("customers")
-            .select("id")
-            .eq("member_id", member_id) // ✅ آیدی عددی
-            .eq("mobile", mobile)
-            .maybeSingle();
+      const insertCustomerSql = `
+        INSERT INTO public.customers
+          (member_id, name, mobile, national_id, address, customer_type, birth_or_register_date, created_at, updated_at)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+        RETURNING *
+      `;
+      const customerRes = await client.query(insertCustomerSql, [
+        member_id,
+        String(name).trim(),
+        mobile || null,
+        national_id || null,
+        address || null,
+        customer_type || "real",
+        birth_or_register_date || null,
+      ]);
+      const newCustomer = customerRes.rows[0];
 
-        if (existMobile) return res.status(409).json({ success: false, error: "شماره موبایل تکراری است." });
+      const nextCode = await generateNextTafsiliCode(member_id, client);
+      const insertTafsiliSql = `
+        INSERT INTO ${TAFSILI_TABLE}
+          (member_id, code, title, tafsili_type, ref_id, is_active, created_at)
+        VALUES
+          ($1, $2, $3, 'customer', $4, true, NOW())
+        RETURNING id
+      `;
+      const tafsiliRes = await client.query(insertTafsiliSql, [member_id, nextCode, String(name).trim(), newCustomer.id]);
 
-        // ---------------------------------------------------------
-        // ۳. ساخت مشتری (مرحله اول)
-        // ---------------------------------------------------------
-        const newCustomerData = {
-            name: name,
-            mobile: mobile,
-            national_id: body.national_id || null,
-            phone: body.phone || null,
-            postal_code: body.postal_code || null,
-            economic_code: body.economic_code || null,
-            address: body.address || null,
-            description: body.description || null,
-            birth_or_register_date: body.birth_or_register_date || null,
-            customer_type: body.customer_type || 'person',
-            member_id: member_id, // ✅ آیدی عددی صحیح
-            tafsili_id: null
-        };
+      await client.query("UPDATE public.customers SET tafsili_id = $1 WHERE id = $2", [
+        tafsiliRes.rows[0].id,
+        newCustomer.id,
+      ]);
 
-        const { data: createdCustomer, error: createError } = await supabaseAdmin
-            .from("customers")
-            .insert([newCustomerData])
-            .select()
-            .single();
+      await client.query("COMMIT");
+      return res.json({ success: true, data: newCustomer, message: "مشتری با موفقیت ایجاد شد" });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("❌ Create Customer Error:", e);
+      return res.status(500).json({ success: false, error: "خطا در ثبت مشتری", detail: e.message });
+    } finally {
+      client.release();
+    }
+  })
+);
 
-        if (createError) {
-            console.error("❌ Customer Insert Error:", createError);
-            if (createError.code === '23505') return res.status(409).json({ success: false, error: "اطلاعات تکراری است" });
-            throw createError;
+// 4) ویرایش مشتری
+router.put(
+  "/:id",
+  authMiddleware,
+  asyncHandler(async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const member_id = getMemberIdFromReq(req);
+      if (!member_id) {
+        return res.status(401).json({ success: false, error: "member_id معتبر نیست" });
+      }
+
+      const id = req.params.id;
+      const { name, mobile, national_id, address, customer_type, birth_or_register_date } = req.body || {};
+
+      await client.query("BEGIN");
+
+      const checkRes = await client.query(
+        "SELECT * FROM public.customers WHERE id = $1 AND member_id = $2 LIMIT 1",
+        [id, member_id]
+      );
+      if (!checkRes.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "مشتری یافت نشد" });
+      }
+      const currentCustomer = checkRes.rows[0];
+
+      if (mobile) {
+        const dupRes = await client.query(
+          "SELECT id FROM public.customers WHERE mobile = $1 AND member_id = $2 AND id <> $3 LIMIT 1",
+          [mobile, member_id, id]
+        );
+        if (dupRes.rows.length) {
+          await client.query("ROLLBACK");
+          return res.status(400).json({ success: false, error: "این شماره موبایل برای مشتری دیگری ثبت شده است" });
         }
+      }
 
-        console.log("✅ Customer Created ID:", createdCustomer.id);
+      const updateSql = `
+        UPDATE public.customers
+        SET
+          name = $1,
+          mobile = $2,
+          national_id = $3,
+          address = $4,
+          customer_type = $5,
+          birth_or_register_date = $6,
+          updated_at = NOW()
+        WHERE id = $7 AND member_id = $8
+        RETURNING *
+      `;
+      const updateRes = await client.query(updateSql, [
+        name || currentCustomer.name,
+        mobile || null,
+        national_id || null,
+        address || null,
+        customer_type || "real",
+        birth_or_register_date || null,
+        id,
+        member_id,
+      ]);
 
-        // ---------------------------------------------------------
-        // ۴. ساخت حساب تفصیلی (مرحله دوم)
-        // ---------------------------------------------------------
-        const nextCode = await generateNextTafsiliCode(member_id);
+      if (currentCustomer.tafsili_id && name && currentCustomer.name !== name) {
+        await client.query(`UPDATE ${TAFSILI_TABLE} SET title = $1, updated_at = NOW() WHERE id = $2`, [
+          String(name).trim(),
+          currentCustomer.tafsili_id,
+        ]);
+      }
 
-        const newTafsiliData = {
-            code: nextCode,
-            title: name,
-            tafsili_type: 'customer',
-            ref_id: createdCustomer.id,
-            member_id: member_id, // ✅ آیدی عددی صحیح
-            is_active: true
-        };
+      await client.query("COMMIT");
+      return res.json({ success: true, data: updateRes.rows[0], message: "ویرایش با موفقیت انجام شد" });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("❌ Update Customer Error:", e);
+      return res.status(500).json({ success: false, error: "خطا در ویرایش مشتری", detail: e.message });
+    } finally {
+      client.release();
+    }
+  })
+);
 
-        const { data: createdTafsili, error: tafsiliError } = await supabaseAdmin
-            .from(TAFSILI_TABLE)
-            .insert([newTafsiliData])
-            .select()
-            .single();
+// 5) حذف مشتری
+router.delete(
+  "/:id",
+  authMiddleware,
+  asyncHandler(async (req, res) => {
+    const client = await pool.connect();
+    try {
+      const member_id = getMemberIdFromReq(req);
+      if (!member_id) {
+        return res.status(401).json({ success: false, error: "member_id معتبر نیست" });
+      }
 
-        if (tafsiliError) {
-            console.error("❌ Tafsili Insert Error:", tafsiliError);
-            // حتی اگر تفصیلی ساخته نشد، موفقیت برمی‌گردانیم چون مشتری ساخته شده
-            return res.json({
-                success: true,
-                data: createdCustomer,
-                message: "مشتری ثبت شد اما در ساخت حساب تفصیلی خطایی رخ داد."
-            });
-        }
+      const id = req.params.id;
 
-        console.log("✅ Tafsili Created ID:", createdTafsili.id);
+      await client.query("BEGIN");
 
-        // ---------------------------------------------------------
-        // ۵. اتصال تفصیلی به مشتری (مرحله سوم - آپدیت)
-        // ---------------------------------------------------------
-        const { error: updateError } = await supabaseAdmin
-            .from("customers")
-            .update({ tafsili_id: createdTafsili.id })
-            .eq("id", createdCustomer.id);
+      const findRes = await client.query(
+        "SELECT tafsili_id FROM public.customers WHERE id = $1 AND member_id = $2 LIMIT 1",
+        [id, member_id]
+      );
+      if (!findRes.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ success: false, error: "مشتری یافت نشد" });
+      }
 
-        if (updateError) {
-            console.error("❌ Update Customer Error:", updateError);
-        } else {
-            console.log("🔗 Linked Tafsili to Customer successfully");
-            createdCustomer.tafsili_id = createdTafsili.id;
-        }
+      const { tafsili_id } = findRes.rows[0];
 
-        return res.json({
-            success: true,
-            data: createdCustomer,
-            message: "مشتری و حساب تفصیلی با موفقیت ثبت شدند"
+      await client.query("DELETE FROM public.customers WHERE id = $1 AND member_id = $2", [id, member_id]);
+
+      if (tafsili_id) {
+        await client.query(`DELETE FROM ${TAFSILI_TABLE} WHERE id = $1 AND member_id = $2`, [tafsili_id, member_id]);
+      }
+
+      await client.query("COMMIT");
+      return res.json({ success: true, message: "مشتری حذف شد" });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      console.error("❌ Delete Customer Error:", e);
+
+      if (e.code === "23503") {
+        return res.status(400). json({
+          success: false,
+          error: "این مشتری دارای سابقه تراکنش مالی است و حذف نمی‌شود.",
         });
+      }
 
-    } catch (e) {
-        console.error("❌ General Error:", e);
-        return res.status(500).json({ success: false, error: e.message });
+      return res.status(500).json({ success: false, error: "خطا در حذف مشتری", detail: e.message });
+    } finally {
+      client.release();
     }
-});
+  })
+);
 
-/* ============================================================
-   UPDATE CUSTOMER
-============================================================ */
-router.put("/:id", authMiddleware, async (req, res) => {
-    try {
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
-
-        const { id, created_at, tafsili_id, ...updates } = req.body;
-
-        // حذف فیلدهای حساس و سیستمی
-        delete updates.member_id;
-
-        const { data, error } = await supabaseAdmin
-            .from("customers")
-            .update(updates)
-            .eq("id", req.params.id)
-            .eq("member_id", member_id)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // اگر نام مشتری عوض شد، نام حساب تفصیلی هم باید عوض شود
-        if ((updates.name || updates.full_name) && data.tafsili_id) {
-            const newName = updates.name || updates.full_name;
-            await supabaseAdmin
-                .from(TAFSILI_TABLE)
-                .update({ title: newName })
-                .eq("id", data.tafsili_id);
-        }
-
-        return res.json({ success: true, data, message: "ویرایش شد" });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* ============================================================
-   DELETE CUSTOMER
-============================================================ */
-router.delete("/:id", authMiddleware, async (req, res) => {
-    try {
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
-
-        // اول اطلاعات مشتری را می‌گیریم تا ID تفصیلی را داشته باشیم
-        const { data: customer } = await supabaseAdmin
-            .from("customers")
-            .select("tafsili_id")
-            .eq("id", req.params.id)
-            .single();
-
-        // حذف مشتری
-        const { error } = await supabaseAdmin
-            .from("customers")
-            .delete()
-            .eq("id", req.params.id)
-            .eq("member_id", member_id);
-
-        if (error?.code === "23503") {
-            return res.status(409).json({
-                success: false,
-                error: "امکان حذف وجود ندارد (این مشتری در سیستم دارای سند یا رسید است)"
-            });
-        }
-        if (error) throw error;
-
-        // حذف حساب تفصیلی متصل (اختیاری اما توصیه شده برای تمیزی دیتابیس)
-        if (customer && customer.tafsili_id) {
-            await supabaseAdmin.from(TAFSILI_TABLE).delete().eq("id", customer.tafsili_id);
-        }
-
-        return res.json({ success: true, message: "حذف شد" });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
+// Error middleware مخصوص این router
+router.use((err, req, res, next) => {
+  console.error("🔥 Customers Router Error:", err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({
+    success: false,
+    error: "خطای داخلی سرور",
+    detail: err?.message || "unknown_error",
+  });
 });
 
 module.exports = router;

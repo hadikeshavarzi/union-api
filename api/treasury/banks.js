@@ -1,315 +1,280 @@
-// api/treasury/banks.js
 const express = require("express");
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const router = express.Router();
+const { pool } = require("../../supabaseAdmin"); // اتصال دیتابیس
 const authMiddleware = require("../middleware/auth");
 
-const router = express.Router();
-
-const pickPgErrorMessage = (err) =>
-    err?.message || err?.details || err?.hint || err?.code || JSON.stringify(err);
-
-/* GET ALL BANKS */
+// ============================================================
+// 1. GET / (لیست بانک‌ها با جستجو و صفحه‌بندی)
+// ============================================================
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const { limit = 100, offset = 0, search, with_tafsili } = req.query;
         const member_id = req.user.id;
+        const { limit = 100, offset = 0, search, with_tafsili } = req.query;
 
-        let selectQuery = with_tafsili === 'true'
-            ? "*, accounting_tafsili(id, code, title)"
-            : "*";
+        const params = [member_id];
+        let whereClause = `WHERE tb.member_id = $1`;
+        let paramIdx = 2;
 
-        let query = supabaseAdmin
-            .from("treasury_banks")
-            .select(selectQuery, { count: "exact" })
-            .eq("member_id", member_id) // ✅ فیلتر تنانت
-            .order("created_at", { ascending: false });
-
+        // جستجو
         if (search) {
-            query = query.or(`bank_name.ilike.%${search}%,account_no.ilike.%${search}%,card_no.ilike.%${search}%`);
+            params.push(`%${search}%`);
+            whereClause += ` AND (tb.bank_name ILIKE $${paramIdx} OR tb.account_no ILIKE $${paramIdx} OR tb.card_no ILIKE $${paramIdx})`;
+            paramIdx++;
         }
 
-        query = query.range(Number(offset), Number(offset) + Number(limit) - 1);
+        // ساخت کوئری اصلی
+        let sql = `
+            SELECT tb.* ${with_tafsili === 'true' ? ", json_build_object('id', t.id, 'code', t.code, 'title', t.title) as accounting_tafsili" : ""}
+            FROM public.treasury_banks tb
+            ${with_tafsili === 'true' ? "LEFT JOIN public.accounting_tafsili t ON tb.tafsili_id = t.id" : ""}
+            ${whereClause}
+            ORDER BY tb.created_at DESC
+            LIMIT $${paramIdx} OFFSET $${paramIdx + 1}
+        `;
 
-        const { data, error, count } = await query;
+        // پارامترهای Limit و Offset
+        params.push(parseInt(limit), parseInt(offset));
 
-        if (error) {
-            console.error("❌ GET Banks Error:", error);
-            return res.status(400).json({ success: false, error: pickPgErrorMessage(error) });
-        }
+        const { rows } = await pool.query(sql, params);
 
-        return res.json({ success: true, data, total: count });
+        // شمارش کل (برای صفحه‌بندی)
+        const countRes = await pool.query(
+            `SELECT COUNT(*)::bigint as total FROM public.treasury_banks tb ${whereClause}`,
+            params.slice(0, paramIdx - 1)
+        );
+
+        res.json({
+            success: true,
+            data: rows,
+            total: Number(countRes.rows[0]?.total || 0)
+        });
+
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({ success: false, error: e.message });
+        console.error("❌ GET Banks Error:", e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* GET ONE BANK */
+// ============================================================
+// 2. GET /:id (دریافت یک بانک)
+// ============================================================
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        const bank_id = Number(req.params.id);
+        const id = parseInt(req.params.id);
         const member_id = req.user.id;
 
-        const { data, error } = await supabaseAdmin
-            .from("treasury_banks")
-            .select("*, accounting_tafsili(id, code, title)")
-            .eq("id", bank_id)
-            .eq("member_id", member_id)
-            .single();
+        const sql = `
+            SELECT tb.*, 
+                   json_build_object('id', t.id, 'code', t.code, 'title', t.title) as accounting_tafsili
+            FROM public.treasury_banks tb
+            LEFT JOIN public.accounting_tafsili t ON tb.tafsili_id = t.id
+            WHERE tb.id = $1 AND tb.member_id = $2
+        `;
 
-        if (error || !data) {
-            return res.status(404).json({
-                success: false,
-                error: "بانک یافت نشد یا دسترسی ندارید"
-            });
+        const { rows } = await pool.query(sql, [id, member_id]);
+
+        if (rows.length === 0) {
+            return res.status(404).json({ success: false, error: "بانک یافت نشد" });
         }
 
-        return res.json({ success: true, data });
+        res.json({ success: true, data: rows[0] });
+
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* CREATE BANK */
+// ============================================================
+// 3. POST / (ثبت بانک جدید + ساخت تفصیلی خودکار)
+// ============================================================
 router.post("/", authMiddleware, async (req, res) => {
+    const client = await pool.connect(); // شروع تراکنش
     try {
         const member_id = req.user.id;
+        const body = req.body;
 
-        console.log("🏦 Creating bank for member:", member_id);
-
-        const payload = {
-            ...req.body,
-            member_id,
-            tafsili_id: null
-        };
-
-        delete payload.id;
-        delete payload.created_at;
-
-        if (!payload.bank_name) {
-            return res.status(400).json({
-                success: false,
-                error: "نام بانک الزامی است"
-            });
+        if (!body.bank_name) {
+            return res.status(400).json({ success: false, error: "نام بانک الزامی است" });
         }
 
-        // 1. ساخت بانک
-        const { data: createdBank, error: bankError } = await supabaseAdmin
-            .from("treasury_banks")
-            .insert([payload])
-            .select()
-            .single();
+        await client.query("BEGIN");
 
-        if (bankError) {
-            console.error("❌ Bank Insert Error:", bankError);
-            if (bankError.code === '23505') {
-                return res.status(409).json({
-                    success: false,
-                    error: "اطلاعات تکراری است"
-                });
-            }
-            throw bankError;
-        }
+        // الف) ثبت بانک
+        const insertBankSql = `
+            INSERT INTO public.treasury_banks (
+                member_id, bank_name, account_no, card_no, shaba_no, 
+                initial_balance, description, is_active, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            RETURNING id, bank_name, account_no, card_no
+        `;
 
-        console.log("✅ Bank Created ID:", createdBank.id);
+        const bankValues = [
+            member_id, body.bank_name, body.account_no, body.card_no, body.shaba_no,
+            body.initial_balance || 0, body.description, body.is_active !== false
+        ];
 
-        // 2. ساخت حساب تفصیلی
-        try {
-            const nextCode = await generateNextTafsiliCode(member_id, 'bank_account');
+        const bankRes = await client.query(insertBankSql, bankValues);
+        const newBank = bankRes.rows[0];
 
-            const tafsiliData = {
-                code: nextCode,
-                title: `${payload.bank_name} - ${payload.account_no || payload.card_no || 'بدون شماره'}`,
-                tafsili_type: 'bank_account',
-                ref_id: createdBank.id,
-                member_id: member_id,
-                is_active: true
-            };
+        // ب) تولید کد تفصیلی
+        const nextCode = await generateNextTafsiliCode(client, member_id, 'bank_account');
+        const tafsiliTitle = `${newBank.bank_name} - ${newBank.account_no || newBank.card_no || 'بدون شماره'}`;
 
-            console.log("💾 Inserting Tafsili for bank:", tafsiliData);
+        // ج) ثبت حساب تفصیلی
+        const insertTafsiliSql = `
+            INSERT INTO public.accounting_tafsili (
+                member_id, code, title, tafsili_type, ref_id, is_active, created_at
+            ) VALUES ($1, $2, $3, 'bank_account', $4, true, NOW())
+            RETURNING id
+        `;
+        const tafsiliRes = await client.query(insertTafsiliSql, [member_id, nextCode, tafsiliTitle, newBank.id]);
+        const newTafsiliId = tafsiliRes.rows[0].id;
 
-            const { data: createdTafsili, error: tafsiliError } = await supabaseAdmin
-                .from("accounting_tafsili")
-                .insert([tafsiliData])
-                .select()
-                .single();
+        // د) آپدیت بانک برای اتصال به تفصیلی
+        await client.query(
+            "UPDATE public.treasury_banks SET tafsili_id = $1 WHERE id = $2",
+            [newTafsiliId, newBank.id]
+        );
 
-            if (tafsiliError) {
-                console.error("❌ Tafsili Insert Error:", tafsiliError);
-                return res.json({
-                    success: true,
-                    data: createdBank,
-                    warning: "بانک ثبت شد اما خطا در ساخت حساب تفصیلی رخ داد",
-                    tafsiliError: tafsiliError.message
-                });
-            }
+        await client.query("COMMIT");
 
-            console.log("✅ Tafsili Created ID:", createdTafsili.id);
-
-            // 3. آپدیت بانک با tafsili_id
-            const { error: updateError } = await supabaseAdmin
-                .from("treasury_banks")
-                .update({ tafsili_id: createdTafsili.id })
-                .eq("id", createdBank.id);
-
-            if (updateError) {
-                console.error("❌ Update Bank Error:", updateError);
-            } else {
-                console.log("🔗 Linked Tafsili to Bank");
-                createdBank.tafsili_id = createdTafsili.id;
-            }
-        } catch (tafsiliErr) {
-            console.error("⚠️ Tafsili creation failed:", tafsiliErr);
-        }
-
-        return res.json({
+        res.json({
             success: true,
-            data: createdBank,
-            message: "بانک با موفقیت ایجاد شد"
+            data: { ...newBank, tafsili_id: newTafsiliId },
+            message: "بانک و حساب تفصیلی با موفقیت ایجاد شدند"
         });
+
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({ success: false, error: e.message });
+        await client.query("ROLLBACK");
+        console.error("❌ Create Bank Error:", e);
+        if (e.code === '23505') {
+            return res.status(409).json({ success: false, error: "اطلاعات تکراری است" });
+        }
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
-/* UPDATE BANK */
+// ============================================================
+// 4. PUT /:id (ویرایش بانک)
+// ============================================================
 router.put("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        const bank_id = Number(req.params.id);
+        const id = parseInt(req.params.id);
         const member_id = req.user.id;
+        const body = req.body;
 
-        const { data: existing } = await supabaseAdmin
-            .from("treasury_banks")
-            .select("id, tafsili_id")
-            .eq("id", bank_id)
-            .eq("member_id", member_id)
-            .single();
+        // چک کردن وجود بانک
+        const checkRes = await client.query(
+            "SELECT id, tafsili_id FROM public.treasury_banks WHERE id = $1 AND member_id = $2",
+            [id, member_id]
+        );
+        if (checkRes.rowCount === 0) return res.status(404).json({ success: false, error: "بانک یافت نشد" });
 
-        if (!existing) {
-            return res.status(404).json({
-                success: false,
-                error: "بانک یافت نشد یا دسترسی ندارید"
-            });
+        const existingBank = checkRes.rows[0];
+
+        await client.query("BEGIN");
+
+        // آپدیت بانک
+        const updateSql = `
+            UPDATE public.treasury_banks SET
+                bank_name=$1, account_no=$2, card_no=$3, shaba_no=$4, 
+                initial_balance=$5, description=$6, is_active=$7
+            WHERE id=$8 AND member_id=$9
+            RETURNING *
+        `;
+        const values = [
+            body.bank_name, body.account_no, body.card_no, body.shaba_no,
+            body.initial_balance || 0, body.description, body.is_active !== false,
+            id, member_id
+        ];
+
+        const updateRes = await client.query(updateSql, values);
+        const updatedBank = updateRes.rows[0];
+
+        // آپدیت نام تفصیلی (اگر متصل باشد)
+        if (existingBank.tafsili_id) {
+            const newTitle = `${updatedBank.bank_name} - ${updatedBank.account_no || updatedBank.card_no || 'بدون شماره'}`;
+            await client.query(
+                "UPDATE public.accounting_tafsili SET title = $1 WHERE id = $2",
+                [newTitle, existingBank.tafsili_id]
+            );
         }
 
-        const payload = { ...req.body };
-        delete payload.id;
-        delete payload.member_id;
-        delete payload.created_at;
-        delete payload.tafsili_id;
+        await client.query("COMMIT");
 
-        const { data, error } = await supabaseAdmin
-            .from("treasury_banks")
-            .update(payload)
-            .eq("id", bank_id)
-            .eq("member_id", member_id)
-            .select()
-            .single();
+        res.json({ success: true, data: updatedBank, message: "بانک ویرایش شد" });
 
-        if (error) {
-            console.error("❌ Update Bank Error:", error);
-            return res.status(400).json({
-                success: false,
-                error: pickPgErrorMessage(error)
-            });
-        }
-
-        // آپدیت نام تفصیلی
-        if ((payload.bank_name || payload.account_no) && existing.tafsili_id) {
-            const newTitle = `${data.bank_name} - ${data.account_no || data.card_no || 'بدون شماره'}`;
-
-            await supabaseAdmin
-                .from("accounting_tafsili")
-                .update({ title: newTitle })
-                .eq("id", existing.tafsili_id);
-        }
-
-        return res.json({
-            success: true,
-            data,
-            message: "بانک با موفقیت ویرایش شد"
-        });
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({ success: false, error: e.message });
+        await client.query("ROLLBACK");
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
-/* DELETE BANK */
+// ============================================================
+// 5. DELETE /:id (حذف بانک)
+// ============================================================
 router.delete("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        const bank_id = Number(req.params.id);
+        const id = parseInt(req.params.id);
         const member_id = req.user.id;
 
-        const { data: bank } = await supabaseAdmin
-            .from("treasury_banks")
-            .select("id, tafsili_id")
-            .eq("id", bank_id)
-            .eq("member_id", member_id)
-            .single();
+        // دریافت اطلاعات برای حذف تفصیلی
+        const checkRes = await client.query(
+            "SELECT id, tafsili_id FROM public.treasury_banks WHERE id = $1 AND member_id = $2",
+            [id, member_id]
+        );
 
-        if (!bank) {
-            return res.status(404).json({
-                success: false,
-                error: "بانک یافت نشد یا دسترسی ندارید"
-            });
-        }
+        if (checkRes.rowCount === 0) return res.status(404).json({ success: false, error: "بانک یافت نشد" });
+        const bank = checkRes.rows[0];
 
-        const { error } = await supabaseAdmin
-            .from("treasury_banks")
-            .delete()
-            .eq("id", bank_id)
-            .eq("member_id", member_id);
+        await client.query("BEGIN");
 
-        if (error) {
-            if (error.code === '23503') {
-                return res.status(409).json({
-                    success: false,
-                    error: "امکان حذف وجود ندارد (بانک در تراکنش‌ها استفاده شده)"
-                });
-            }
-            throw error;
-        }
+        // حذف بانک
+        await client.query("DELETE FROM public.treasury_banks WHERE id = $1", [id]);
 
-        // حذف تفصیلی
+        // حذف تفصیلی (اگر وجود دارد)
         if (bank.tafsili_id) {
-            await supabaseAdmin
-                .from("accounting_tafsili")
-                .delete()
-                .eq("id", bank.tafsili_id);
+            await client.query("DELETE FROM public.accounting_tafsili WHERE id = $1", [bank.tafsili_id]);
         }
 
-        return res.json({
-            success: true,
-            message: "بانک با موفقیت حذف شد"
-        });
+        await client.query("COMMIT");
+        res.json({ success: true, message: "بانک و حساب تفصیلی مربوطه حذف شدند" });
+
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+        await client.query("ROLLBACK");
+        if (e.code === '23503') {
+            return res.status(409).json({ success: false, error: "این بانک دارای تراکنش است و قابل حذف نیست" });
+        }
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
-/* Helper: تولید کد تفصیلی */
-async function generateNextTafsiliCode(memberId, type = 'bank_account') {
+// ============================================================
+// Helper: تولید کد تفصیلی
+// ============================================================
+async function generateNextTafsiliCode(client, memberId, type) {
     try {
-        const { data: lastRecord } = await supabaseAdmin
-            .from("accounting_tafsili")
-            .select("code")
-            .eq("member_id", memberId)
-            .eq("tafsili_type", type)
-            .lt('code', '999999')
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+        const { rows } = await client.query(`
+            SELECT code FROM public.accounting_tafsili 
+            WHERE member_id = $1 AND tafsili_type = $2 
+            ORDER BY code DESC LIMIT 1
+        `, [memberId, type]);
 
         let nextNum = 1;
-        if (lastRecord && lastRecord.code && !isNaN(Number(lastRecord.code))) {
-            nextNum = Number(lastRecord.code) + 1;
+        if (rows.length > 0 && !isNaN(Number(rows[0].code))) {
+            nextNum = Number(rows[0].code) + 1;
         }
-
         return String(nextNum).padStart(4, "0");
     } catch (e) {
-        console.error("❌ Code Gen Error:", e);
+        console.error("Code Gen Error:", e);
         return "0001";
     }
 }

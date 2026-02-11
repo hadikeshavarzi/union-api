@@ -1,259 +1,170 @@
-// api/productCategories.js
+// api/productCategories.js - GLOBAL MODE (No owner_id)
 const express = require("express");
-const { supabaseAdmin } = require("../supabaseAdmin");
-
-// 👇 اصلاح شد: حذف {} (حیاتی!)
-// اگر فایل auth.js داخل پوشه api/middleware است، همین مسیر درست است.
-// اگر فایل auth.js در روت پروژه (middleware/) است، باید ../middleware/auth باشد.
 const authMiddleware = require("./middleware/auth");
-
+const { pool } = require("../supabaseAdmin");
 const router = express.Router();
 
-/* =====================================================================
-   UTIL: Normalize
-===================================================================== */
-function normalizeCategory(body) {
+const isUUID = (str) => {
+    if (!str) return false;
+    const regex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    return regex.test(str);
+};
+
+function normalizeCategory(body = {}) {
     return {
-        name: body.name,
-        slug: body.slug,
-        parent_id: body.parent_id || null,
-        description: body.description || "",
-        image_id: body.image_id || null,
-        is_active: body.is_active ?? true,
-        sort_order: body.sort_order ?? 0,
-        storage_cost: body.storage_cost ?? null,
-        loading_cost: body.loading_cost ?? null,
+        name: body.name?.trim() || null,
+        slug: body.slug?.trim() || null,
+        parent_id: (body.parent_id && isUUID(body.parent_id)) ? body.parent_id : null,
+        description: body.description ?? "",
+        image_id: (body.image_id && isUUID(body.image_id)) ? body.image_id : null,
+        is_active: body.is_active !== false,
+        sort_order: Number(body.sort_order) || 0,
+        storage_cost: Number(body.storage_cost) || 0,
+        loading_cost: Number(body.loading_cost) || 0,
     };
 }
 
-/* =====================================================================
-   GET ALL CATEGORIES (Public)
-===================================================================== */
-router.get("/", async (req, res) => {
+// GET ALL (بدون فیلتر owner_id)
+router.get("/", authMiddleware, async (req, res) => {
     try {
-        const { limit = 500, search, parent_id } = req.query;
+        const { limit: limitRaw = 500, search, parent_id, is_active } = req.query;
+        const limit = Math.min(Math.max(parseInt(limitRaw, 10) || 500, 1), 2000);
 
-        let query = supabaseAdmin
-            .from("product_categories")
-            .select("*", { count: "exact" })
-            .order("sort_order", { ascending: true });
+        const params = [];
+        let where = "WHERE 1=1"; // شرط همیشه درست (چون owner_id نداریم)
+        let idx = 1;
 
-        // Search
-        if (search) {
-            query = query.ilike("name", `%${search}%`);
+        if (search && String(search).trim()) {
+            params.push(`%${String(search).trim()}%`);
+            where += ` AND name ILIKE $${idx++}`;
+        }
+        if (parent_id && isUUID(parent_id)) {
+            params.push(parent_id);
+            where += ` AND parent_id = $${idx++}`;
+        }
+        if (is_active !== undefined) {
+            params.push(is_active === 'true');
+            where += ` AND is_active = $${idx++}`;
         }
 
-        // Filter by parent
-        if (parent_id) {
-            query = query.eq("parent_id", parent_id);
-        }
+        params.push(limit);
 
-        // Limit
-        if (limit) {
-            query = query.limit(Number(limit));
-        }
+        const dataSql = `
+            SELECT * FROM public.product_categories
+            ${where}
+            ORDER BY sort_order ASC, created_at DESC
+            LIMIT $${idx}
+        `;
 
-        const { data, error, count } = await query;
-
-        if (error) {
-            return res.status(400).json({
-                success: false,
-                error: error.message,
-            });
-        }
-
-        return res.json({
-            success: true,
-            data,
-            total: count
-        });
-
+        const { rows } = await pool.query(dataSql, params);
+        res.json({ success: true, data: rows || [], count: rows.length });
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message,
-        });
+        console.error("GET Categories Error:", e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* =====================================================================
-   GET ONE CATEGORY (Public)
-===================================================================== */
-router.get("/:id", async (req, res) => {
+// GET ONE
+router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin
-            .from("product_categories")
-            .select("*")
-            .eq("id", req.params.id)
-            .single();
+        const { id } = req.params;
+        if (!isUUID(id)) return res.status(400).json({ success: false, error: "Invalid ID" });
 
-        if (error) {
-            return res.status(404).json({
-                success: false,
-                error: "دسته‌بندی یافت نشد",
-            });
-        }
-
-        return res.json({ success: true, data });
-
+        // حذف شرط owner_id
+        const sql = `SELECT * FROM public.product_categories WHERE id = $1 LIMIT 1`;
+        const { rows } = await pool.query(sql, [id]);
+        if (!rows.length) return res.status(404).json({ success: false, error: "Not Found" });
+        res.json({ success: true, data: rows[0] });
     } catch (e) {
-        return res.status(500).json({
-            success: false,
-            error: e.message,
-        });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* =====================================================================
-   CREATE CATEGORY (Protected) 🔒
-===================================================================== */
+// CREATE
 router.post("/", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
+        // حذف owner_id از ورودی
         const payload = normalizeCategory(req.body);
+        if (!payload.name) return res.status(400).json({ success: false, error: "Name required" });
 
-        if (!payload.name) {
-            return res.status(400).json({
-                success: false,
-                error: "نام دسته‌بندی الزامی است"
-            });
-        }
+        await client.query("BEGIN");
 
-        const { data, error } = await supabaseAdmin
-            .from("product_categories")
-            .insert(payload)
-            .select()
-            .single();
-
-        if (error) {
-            console.log("❌ CREATE ERROR:", error);
-            return res.status(400).json({
-                success: false,
-                error: error.message,
-            });
-        }
-
-        return res.json({
-            success: true,
-            data,
-            message: "دسته‌بندی با موفقیت ایجاد شد"
-        });
-
+        // حذف ستون owner_id از اینسرت
+        const sql = `
+            INSERT INTO public.product_categories (
+                name, slug, parent_id, description, image_id,
+                is_active, sort_order, storage_cost, loading_cost,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+            RETURNING *
+        `;
+        const r = await client.query(sql, [
+            payload.name, payload.slug, payload.parent_id, payload.description,
+            payload.image_id, payload.is_active, payload.sort_order, payload.storage_cost, payload.loading_cost
+        ]);
+        await client.query("COMMIT");
+        res.json({ success: true, data: r.rows[0], message: "ایجاد شد" });
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message,
-        });
-    }
+        await client.query("ROLLBACK");
+        console.error("CREATE Error:", e);
+        if (e.code === "23505") return res.status(409).json({ success: false, error: "تکراری" });
+        res.status(500).json({ success: false, error: e.message });
+    } finally { client.release(); }
 });
 
-/* =====================================================================
-   UPDATE CATEGORY (Protected) 🔒
-===================================================================== */
+// UPDATE
 router.put("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
+        const { id } = req.params;
+        if (!isUUID(id)) return res.status(400).json({ success: false, error: "Invalid ID" });
+
         const payload = normalizeCategory(req.body);
+        if (!payload.name) return res.status(400).json({ success: false, error: "Name required" });
 
-        const { data, error } = await supabaseAdmin
-            .from("product_categories")
-            .update(payload)
-            .eq("id", req.params.id)
-            .select()
-            .single();
+        await client.query("BEGIN");
 
-        if (error) {
-            console.log("❌ UPDATE ERROR:", error);
-            return res.status(400).json({
-                success: false,
-                error: error.message,
-            });
+        // حذف owner_id از شرط
+        const sql = `
+            UPDATE public.product_categories
+            SET name=$1, slug=$2, parent_id=$3, description=$4, image_id=$5,
+                is_active=$6, sort_order=$7, storage_cost=$8, loading_cost=$9, updated_at=NOW()
+            WHERE id=$10
+            RETURNING *
+        `;
+        const r = await client.query(sql, [
+            payload.name, payload.slug, payload.parent_id, payload.description, payload.image_id,
+            payload.is_active, payload.sort_order, payload.storage_cost, payload.loading_cost,
+            id
+        ]);
+
+        if (!r.rows.length) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ success: false, error: "Not Found" });
         }
-
-        return res.json({
-            success: true,
-            data,
-            message: "دسته‌بندی با موفقیت بروزرسانی شد"
-        });
-
+        await client.query("COMMIT");
+        res.json({ success: true, data: r.rows[0], message: "بروزرسانی شد" });
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message,
-        });
-    }
+        await client.query("ROLLBACK");
+        res.status(500).json({ success: false, error: e.message });
+    } finally { client.release(); }
 });
 
-/* =====================================================================
-   PATCH CATEGORY (Protected) 🔒
-===================================================================== */
-router.patch("/:id", authMiddleware, async (req, res) => {
-    try {
-        const { data, error } = await supabaseAdmin
-            .from("product_categories")
-            .update(req.body)
-            .eq("id", req.params.id)
-            .select()
-            .single();
-
-        if (error) {
-            return res.status(400).json({
-                success: false,
-                error: error.message
-            });
-        }
-
-        return res.json({ success: true, data });
-
-    } catch (e) {
-        return res.status(500).json({
-            success: false,
-            error: e.message
-        });
-    }
-});
-
-/* =====================================================================
-   DELETE CATEGORY (Protected) 🔒
-===================================================================== */
+// DELETE
 router.delete("/:id", authMiddleware, async (req, res) => {
     try {
-        const id = req.params.id;
+        const { id } = req.params;
+        if (!isUUID(id)) return res.status(400).json({ success: false, error: "Invalid ID" });
 
-        const { error } = await supabaseAdmin
-            .from("product_categories")
-            .delete()
-            .eq("id", id);
+        // حذف owner_id از شرط
+        const r = await pool.query(`DELETE FROM public.product_categories WHERE id=$1`, [id]);
+        if (r.rowCount === 0) return res.status(404).json({ success: false, error: "Not Found" });
 
-        // FK Error
-        if (error?.code === "23503") {
-            return res.status(409).json({
-                success: false,
-                error: "امکان حذف این دسته‌بندی وجود ندارد",
-                message: "این دسته‌بندی در محصولات یا زیردسته‌ها استفاده شده است",
-            });
-        }
-
-        if (error) {
-            console.log("❌ DELETE ERROR:", error);
-            return res.status(400).json({
-                success: false,
-                error: error.message,
-            });
-        }
-
-        return res.json({
-            success: true,
-            message: "دسته‌بندی با موفقیت حذف شد"
-        });
-
+        res.json({ success: true, message: "حذف شد" });
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message,
-        });
+        if (e.code === "23503") return res.status(409).json({ success: false, error: "وابستگی دارد" });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 

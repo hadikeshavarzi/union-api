@@ -1,281 +1,150 @@
-// api/treasury/pos.js
 const express = require("express");
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const router = express.Router();
+const { pool } = require("../../supabaseAdmin");
 const authMiddleware = require("../middleware/auth");
 
-const router = express.Router();
-
-/* GET ALL POS */
-router.get("/", authMiddleware, async (req, res) => {
+// Helper: تولید کد تفصیلی
+async function generateNextTafsiliCode(client, memberId, type) {
     try {
-        const { with_bank, with_tafsili } = req.query;
-        const member_id = req.user.id;
+        const res = await client.query(`
+            SELECT MAX(code::int) as max_code 
+            FROM public.accounting_tafsili 
+            WHERE member_id = $1 AND tafsili_type = $2 AND code ~ '^[0-9]+$'
+        `, [memberId, type]);
 
-        let selectQuery = "*";
-
-        if (with_bank === 'true') {
-            selectQuery += ", treasury_banks(id, bank_name, account_no)";
-        }
-
-        if (with_tafsili === 'true') {
-            selectQuery += ", accounting_tafsili(id, code, title)";
-        }
-
-        const { data, error } = await supabaseAdmin
-            .from("treasury_pos")
-            .select(selectQuery)
-            .eq("member_id", member_id) // ✅ فیلتر تنانت
-            .order("created_at", { ascending: false });
-
-        if (error) throw error;
-
-        return res.json({ success: true, data });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* GET ONE POS */
-router.get("/:id", authMiddleware, async (req, res) => {
-    try {
-        const { data, error } = await supabaseAdmin
-            .from("treasury_pos")
-            .select(`
-                *,
-                treasury_banks(id, bank_name, account_no),
-                accounting_tafsili(id, code, title)
-            `)
-            .eq("id", req.params.id)
-            .eq("member_id", req.user.id)
-            .single();
-
-        if (error || !data) {
-            return res.status(404).json({
-                success: false,
-                error: "POS یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        return res.json({ success: true, data });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* CREATE POS */
-router.post("/", authMiddleware, async (req, res) => {
-    try {
-        const member_id = req.user.id;
-
-        const payload = {
-            ...req.body,
-            member_id,
-            tafsili_id: null
-        };
-
-        delete payload.id;
-        delete payload.created_at;
-
-        if (!payload.title || !payload.bank_id) {
-            return res.status(400).json({
-                success: false,
-                error: "عنوان و حساب متصل الزامی است"
-            });
-        }
-
-        // چک اینکه bank_id متعلق به این member باشه
-        const { data: bank } = await supabaseAdmin
-            .from("treasury_banks")
-            .select("id")
-            .eq("id", payload.bank_id)
-            .eq("member_id", member_id)
-            .single();
-
-        if (!bank) {
-            return res.status(403).json({
-                success: false,
-                error: "بانک انتخابی یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        // 1. ساخت POS
-        const { data: createdPos, error: posError } = await supabaseAdmin
-            .from("treasury_pos")
-            .insert([payload])
-            .select()
-            .single();
-
-        if (posError) throw posError;
-
-        // 2. ساخت تفصیلی
-        try {
-            const nextCode = await generateNextTafsiliCode(member_id, 'pos');
-
-            const tafsiliData = {
-                code: nextCode,
-                title: payload.title,
-                tafsili_type: 'pos',
-                ref_id: createdPos.id,
-                member_id: member_id,
-                is_active: true
-            };
-
-            const { data: createdTafsili, error: tafsiliError } = await supabaseAdmin
-                .from("accounting_tafsili")
-                .insert([tafsiliData])
-                .select()
-                .single();
-
-            if (!tafsiliError) {
-                await supabaseAdmin
-                    .from("treasury_pos")
-                    .update({ tafsili_id: createdTafsili.id })
-                    .eq("id", createdPos.id);
-
-                createdPos.tafsili_id = createdTafsili.id;
-            }
-        } catch (e) {
-            console.error("⚠️ Tafsili creation failed:", e);
-        }
-
-        return res.json({
-            success: true,
-            data: createdPos,
-            message: "POS با موفقیت ایجاد شد"
-        });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* UPDATE POS */
-router.put("/:id", authMiddleware, async (req, res) => {
-    try {
-        const pos_id = Number(req.params.id);
-        const member_id = req.user.id;
-
-        const { data: existing } = await supabaseAdmin
-            .from("treasury_pos")
-            .select("id, tafsili_id")
-            .eq("id", pos_id)
-            .eq("member_id", member_id)
-            .single();
-
-        if (!existing) {
-            return res.status(404).json({
-                success: false,
-                error: "POS یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        const payload = { ...req.body };
-        delete payload.id;
-        delete payload.member_id;
-        delete payload.created_at;
-        delete payload.tafsili_id;
-
-        const { data, error } = await supabaseAdmin
-            .from("treasury_pos")
-            .update(payload)
-            .eq("id", pos_id)
-            .eq("member_id", member_id)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // آپدیت تفصیلی
-        if (payload.title && existing.tafsili_id) {
-            await supabaseAdmin
-                .from("accounting_tafsili")
-                .update({ title: payload.title })
-                .eq("id", existing.tafsili_id);
-        }
-
-        return res.json({
-            success: true,
-            data,
-            message: "POS با موفقیت ویرایش شد"
-        });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* DELETE POS */
-router.delete("/:id", authMiddleware, async (req, res) => {
-    try {
-        const pos_id = Number(req.params.id);
-        const member_id = req.user.id;
-
-        const { data: pos } = await supabaseAdmin
-            .from("treasury_pos")
-            .select("id, tafsili_id")
-            .eq("id", pos_id)
-            .eq("member_id", member_id)
-            .single();
-
-        if (!pos) {
-            return res.status(404).json({
-                success: false,
-                error: "POS یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        const { error } = await supabaseAdmin
-            .from("treasury_pos")
-            .delete()
-            .eq("id", pos_id)
-            .eq("member_id", member_id);
-
-        if (error) {
-            if (error.code === '23503') {
-                return res.status(409).json({
-                    success: false,
-                    error: "امکان حذف وجود ندارد (POS در تراکنش‌ها استفاده شده)"
-                });
-            }
-            throw error;
-        }
-
-        // حذف تفصیلی
-        if (pos.tafsili_id) {
-            await supabaseAdmin
-                .from("accounting_tafsili")
-                .delete()
-                .eq("id", pos.tafsili_id);
-        }
-
-        return res.json({
-            success: true,
-            message: "POS با موفقیت حذف شد"
-        });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-async function generateNextTafsiliCode(memberId, type) {
-    try {
-        const { data: lastRecord } = await supabaseAdmin
-            .from("accounting_tafsili")
-            .select("code")
-            .eq("member_id", memberId)
-            .eq("tafsili_type", type)
-            .lt('code', '999999')
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
-
-        let nextNum = 1;
-        if (lastRecord && lastRecord.code && !isNaN(Number(lastRecord.code))) {
-            nextNum = Number(lastRecord.code) + 1;
-        }
-
-        return String(nextNum).padStart(4, "0");
+        const max = res.rows[0]?.max_code || 0;
+        return String(max + 1).padStart(4, "0");
     } catch (e) {
         return "0001";
     }
 }
+
+// 1. لیست کارتخوان‌ها (GET)
+router.get("/", authMiddleware, async (req, res) => {
+    try {
+        const member_id = req.user.id;
+        const { with_bank, with_tafsili } = req.query;
+
+        let sql = `
+            SELECT tp.* ${with_bank === 'true' ? ", json_build_object('id', tb.id, 'bank_name', tb.bank_name, 'account_no', tb.account_no) as treasury_banks" : ""}
+            ${with_tafsili === 'true' ? ", json_build_object('id', t.id, 'code', t.code, 'title', t.title) as accounting_tafsili" : ""}
+            FROM public.treasury_pos tp
+            ${with_bank === 'true' ? "LEFT JOIN public.treasury_banks tb ON tp.bank_id = tb.id" : ""}
+            ${with_tafsili === 'true' ? "LEFT JOIN public.accounting_tafsili t ON tp.tafsili_id = t.id" : ""}
+            WHERE tp.member_id = $1
+            ORDER BY tp.created_at DESC
+        `;
+
+        const { rows } = await pool.query(sql, [member_id]);
+        res.json({ success: true, data: rows });
+
+    } catch (e) {
+        console.error("❌ GET POS Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 2. دریافت یک کارتخوان
+router.get("/:id", authMiddleware, async (req, res) => {
+    try {
+        const id = parseInt(req.params.id);
+        const member_id = req.user.id;
+
+        const sql = `
+            SELECT tp.*,
+                   json_build_object('id', tb.id, 'bank_name', tb.bank_name, 'account_no', tb.account_no) as treasury_banks,
+                   json_build_object('id', t.id, 'code', t.code, 'title', t.title) as accounting_tafsili
+            FROM public.treasury_pos tp
+            LEFT JOIN public.treasury_banks tb ON tp.bank_id = tb.id
+            LEFT JOIN public.accounting_tafsili t ON tp.tafsili_id = t.id
+            WHERE tp.id = $1 AND tp.member_id = $2
+        `;
+
+        const { rows } = await pool.query(sql, [id, member_id]);
+        if (rows.length === 0) return res.status(404).json({ success: false, error: "کارتخوان یافت نشد" });
+
+        res.json({ success: true, data: rows[0] });
+
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 3. ایجاد کارتخوان
+router.post("/", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const member_id = req.user.id;
+        const { title, bank_id, terminal_id, description, is_active } = req.body;
+
+        if (!title || !bank_id) return res.status(400).json({ success: false, error: "عنوان و حساب متصل الزامی است" });
+
+        await client.query("BEGIN");
+
+        // الف) چک کردن بانک
+        const bankCheck = await client.query("SELECT id FROM public.treasury_banks WHERE id=$1 AND member_id=$2", [bank_id, member_id]);
+        if (bankCheck.rowCount === 0) return res.status(403).json({ success: false, error: "بانک یافت نشد" });
+
+        // ب) ثبت POS
+        const insertPosSql = `
+            INSERT INTO public.treasury_pos (
+                member_id, title, bank_id, terminal_id, description, is_active, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            RETURNING id, title
+        `;
+        const posRes = await client.query(insertPosSql, [member_id, title, bank_id, terminal_id, description, is_active !== false]);
+        const newPos = posRes.rows[0];
+
+        // ج) تفصیلی
+        const nextCode = await generateNextTafsiliCode(client, member_id, 'pos');
+        const insertTafsiliSql = `
+            INSERT INTO public.accounting_tafsili (
+                member_id, code, title, tafsili_type, ref_id, is_active, created_at
+            ) VALUES ($1, $2, $3, 'pos', $4, true, NOW())
+            RETURNING id
+        `;
+        const tafsiliRes = await client.query(insertTafsiliSql, [member_id, nextCode, title, newPos.id]);
+        const tafsiliId = tafsiliRes.rows[0].id;
+
+        // د) آپدیت POS
+        await client.query("UPDATE public.treasury_pos SET tafsili_id = $1 WHERE id = $2", [tafsiliId, newPos.id]);
+
+        await client.query("COMMIT");
+        res.json({ success: true, data: { ...newPos, tafsili_id: tafsiliId }, message: "کارتخوان ایجاد شد" });
+
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("❌ Create POS Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 4. ویرایش و حذف (مشابه بالا)
+router.delete("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id = parseInt(req.params.id);
+        const member_id = req.user.id;
+
+        const checkRes = await client.query("SELECT id, tafsili_id FROM public.treasury_pos WHERE id=$1 AND member_id=$2", [id, member_id]);
+        if (checkRes.rowCount === 0) return res.status(404).json({ success: false, error: "یافت نشد" });
+        const pos = checkRes.rows[0];
+
+        await client.query("BEGIN");
+        await client.query("DELETE FROM public.treasury_pos WHERE id=$1", [id]);
+        if (pos.tafsili_id) await client.query("DELETE FROM public.accounting_tafsili WHERE id=$1", [pos.tafsili_id]);
+        await client.query("COMMIT");
+
+        res.json({ success: true, message: "کارتخوان حذف شد" });
+    } catch (e) {
+        await client.query("ROLLBACK");
+        if (e.code === '23503') return res.status(409).json({ success: false, error: "امکان حذف وجود ندارد" });
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
+    }
+});
 
 module.exports = router;

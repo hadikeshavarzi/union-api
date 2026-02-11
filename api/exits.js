@@ -1,293 +1,425 @@
+// api/exits.js (Converted to PostgreSQL)
 const express = require("express");
-const { supabaseAdmin } = require("../supabaseAdmin");
+const { pool } = require("../supabaseAdmin"); // استفاده از pool به جای supabaseAdmin
+// حذف یکی از نقاط چون نیازی به برگشت به پوشه قبل نیست
 const authMiddleware = require("./middleware/auth");
-
 const router = express.Router();
 
-// --- Helper: دریافت آیدی عددی ممبر ---
-async function getNumericMemberId(idInput) {
-    if (!idInput) return null;
-    if (!isNaN(idInput) && !String(idInput).includes("-")) return Number(idInput);
-    const { data } = await supabaseAdmin.from('members').select('id').eq('auth_user_id', idInput).maybeSingle();
-    return data ? data.id : null;
+/* ============================================================
+   Helpers (SQL Versions)
+============================================================ */
+
+// تبدیل آرایه ID ها به Map برای دسترسی سریع
+async function pickMapById(client, table, ids, selectCols = "*") {
+    if (!ids || ids.length === 0) return {};
+    // تبدیل ids به آرایه یونیک و حذف null
+    const uniqueIds = [...new Set(ids.filter(Boolean))];
+    if (uniqueIds.length === 0) return {};
+
+    const query = `SELECT ${selectCols} FROM public.${table} WHERE id = ANY($1::int[])`;
+    const { rows } = await client.query(query, [uniqueIds]);
+
+    const map = {};
+    rows.forEach(row => { map[row.id] = row; });
+    return map;
 }
 
-// --- Helper: تولید شماره خروج ---
-async function generateExitNo(memberId) {
-    const { count } = await supabaseAdmin.from("warehouse_exits").select("*", { count: "exact", head: true }).eq("member_id", memberId);
+// تولید شماره خروج
+async function generateExitNo(client, memberId) {
+    const { rows } = await client.query(
+        `SELECT COUNT(*) as count FROM public.warehouse_exits WHERE member_id = $1`,
+        [memberId]
+    );
+    const count = Number(rows[0]?.count || 0);
     return (Number(memberId) * 1000) + 9000 + (count + 1);
 }
 
-// ============================================================
-//  1. دریافت لیست کامل خروجی‌ها (مخصوص صفحه لیست) - ✅ اضافه شد
-//  GET /api/exits
-// ============================================================
-// در فایل api/exits.js
-// در فایل api/exits.js
-// روت دریافت لیست (اصلاح شده برای بازگرداندن تمام فیلدها)
+function toNum(v, d = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : d;
+}
+
+/* ============================================================
+   1) GET /api/exits  لیست خروجی‌ها
+============================================================ */
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
+        const memberId = req.user.id; // فرض بر اینکه id عددی است، اگر authMiddleware آیدی عددی ست می‌کند
 
-        const { data, error } = await supabaseAdmin
-            .from("warehouse_exits")
-            .select(`
-                id, exit_no, exit_date, status, total_fee,
-                driver_name, plate_number, created_at,
-                weighbridge_fee, extra_fee, vat_fee, extra_description, total_loading_fee, payment_method, 
-                loading_order:loading_orders ( order_no ),
-                customer:customers ( name ), 
-                items:warehouse_exit_items (
-                    id, qty, weight_net, fee_price, loading_fee, final_fee,
-                    loading_item:loading_order_items (
-                        batch_no,
-                        product:products ( name )
-                    )
-                )
-            `) // 👈 فیلدهای weighbridge_fee, extra_fee, batch_no, fee_price اضافه شدند
-            .eq("member_id", numericId)
-            .order('created_at', { ascending: false });
+        // دریافت لیست خروج‌ها
+        const { rows: exits } = await pool.query(
+            `SELECT * FROM public.warehouse_exits WHERE member_id = $1 ORDER BY created_at DESC`,
+            [memberId]
+        );
 
-        if (error) throw error;
-        return res.json({ success: true, data });
+        if (exits.length === 0) return res.json({ success: true, data: [] });
+
+        // جمع‌آوری ID ها برای کوئری‌های بعدی
+        const loadingOrderIds = exits.map(e => e.loading_order_id);
+        const ownerIds = exits.map(e => e.owner_id);
+        const exitIds = exits.map(e => e.id);
+
+        // دریافت اطلاعات تکمیلی به صورت موازی
+        const [loadingOrdersMap, customersMap] = await Promise.all([
+            pickMapById(pool, "loading_orders", loadingOrderIds, "id,order_no"),
+            pickMapById(pool, "customers", ownerIds, "id,name")
+        ]);
+
+        // دریافت آیتم‌های خروج
+        const { rows: allItems } = await pool.query(
+            `SELECT * FROM public.warehouse_exit_items WHERE warehouse_exit_id = ANY($1::int[])`,
+            [exitIds]
+        );
+
+        // دریافت اطلاعات کالای مرتبط با آیتم‌ها
+        const loadingItemIds = allItems.map(i => i.loading_item_id);
+        const loadingItemsMap = await pickMapById(pool, "loading_order_items", loadingItemIds, "id,batch_no,product_id,qty");
+
+        const productIds = Object.values(loadingItemsMap).map(li => li.product_id);
+        const productsMap = await pickMapById(pool, "products", productIds, "id,name");
+
+        // گروه‌بندی آیتم‌ها بر اساس exit_id
+        const itemsByExit = {};
+        allItems.forEach(it => {
+            if (!itemsByExit[it.warehouse_exit_id]) itemsByExit[it.warehouse_exit_id] = [];
+
+            const li = loadingItemsMap[it.loading_item_id];
+            const pr = li ? productsMap[li.product_id] : null;
+
+            itemsByExit[it.warehouse_exit_id].push({
+                id: it.id,
+                qty: it.qty,
+                weight_net: it.weight_net,
+                fee_price: it.fee_price,
+                loading_fee: it.loading_fee,
+                final_fee: it.final_fee,
+                loading_item: {
+                    batch_no: li?.batch_no,
+                    product: { name: pr?.name },
+                },
+            });
+        });
+
+        // فرمت نهایی
+        const result = exits.map(e => ({
+            ...e,
+            loading_order: e.loading_order_id ? { order_no: loadingOrdersMap[e.loading_order_id]?.order_no } : null,
+            customer: e.owner_id ? { name: customersMap[e.owner_id]?.name } : null,
+            items: itemsByExit[e.id] || [],
+        }));
+
+        return res.json({ success: true, data: result });
 
     } catch (e) {
-        console.error("❌ Get List Error:", e);
+        console.error("❌ Get Exits Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
     }
-});// ============================================================
-//  2. جستجوی هوشمند (دستور بارگیری یا سند خروج)
-//  GET /api/exits/search/:term
-// ============================================================
+});
+
+/* ============================================================
+   2) GET /api/exits/search/:term
+============================================================ */
 router.get("/search/:term", authMiddleware, async (req, res) => {
     try {
         const term = req.params.term;
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
+        const memberId = req.user.id;
 
         let exitRecord = null;
         let loadingOrderRecord = null;
 
-        // A. اول: جستجو در دستورهای بارگیری
-        const { data: loadingOrder } = await supabaseAdmin
-            .from("loading_orders")
-            .select(`*, clearance:clearances ( customer_id, customer:customers ( id, name ) )`)
-            .eq("order_no", term)
-            .eq("member_id", numericId)
-            .maybeSingle();
+        // A) جستجو در loading_orders
+        const { rows: loRows } = await pool.query(
+            `SELECT * FROM public.loading_orders WHERE order_no = $1 AND member_id = $2`,
+            [term, memberId]
+        );
 
-        if (loadingOrder) {
-            const { data: existingExit } = await supabaseAdmin
-                .from("warehouse_exits")
-                .select(`*, items:warehouse_exit_items (*, loading_item:loading_order_items (product:products(id, name, effective_storage_cost, effective_loading_cost, product_categories(fee_type)), clearance_items(created_at, weight), batch_no))`)
-                .eq("loading_order_id", loadingOrder.id)
-                .maybeSingle();
+        if (loRows.length > 0) {
+            const loadingOrder = loRows[0];
+            // چک کنیم آیا خروج دارد؟
+            const { rows: exRows } = await pool.query(
+                `SELECT * FROM public.warehouse_exits WHERE loading_order_id = $1 AND member_id = $2`,
+                [loadingOrder.id, memberId]
+            );
 
-            if (existingExit) exitRecord = existingExit;
+            if (exRows.length > 0) exitRecord = exRows[0];
             else loadingOrderRecord = loadingOrder;
         }
 
-        // B. دوم: جستجو در شماره سند خروج
+        // B) جستجو با ID خروج (اگر پیدا نشد و term عدد بود)
         if (!exitRecord && !loadingOrderRecord && !isNaN(term)) {
-            const { data: exitById } = await supabaseAdmin
-                .from("warehouse_exits")
-                .select(`*, loading_order:loading_orders ( order_no, driver_name, plate_number, clearances(customer_id, customers(name)) ), items:warehouse_exit_items (*, loading_item:loading_order_items (product:products(id, name, effective_storage_cost, effective_loading_cost, product_categories(fee_type)), clearance_items(created_at, weight), batch_no))`)
-                .eq("id", term)
-                .eq("member_id", numericId)
-                .maybeSingle();
-
-            if (exitById) exitRecord = exitById;
+            const { rows: exRows } = await pool.query(
+                `SELECT * FROM public.warehouse_exits WHERE id = $1 AND member_id = $2`,
+                [term, memberId]
+            );
+            if (exRows.length > 0) exitRecord = exRows[0];
         }
 
         if (!exitRecord && !loadingOrderRecord) {
-            return res.status(404).json({ success: false, message: "سندی یافت نشد یا دسترسی ندارید." });
+            return res.status(404).json({ success: false, message: "سندی یافت نشد." });
         }
 
-        let responseData = {};
-
+        // --- حالت ۱: نمایش سند خروج موجود ---
         if (exitRecord) {
-            responseData = {
-                source: 'exit_record', is_processed: true, status: exitRecord.status, exit_id: exitRecord.id,
-                loading_id: exitRecord.loading_order_id, order_no: exitRecord.loading_order?.order_no || loadingOrder?.order_no,
-                driver_name: exitRecord.driver_name, plate_number: exitRecord.plate_number,
-                customer_name: exitRecord.loading_order?.clearances?.customers?.name || loadingOrder?.clearance?.customer?.name,
-                customer_id: exitRecord.owner_id, driver_national_code: exitRecord.driver_national_code,
-                weighbridge_fee: exitRecord.weighbridge_fee, extra_fee: exitRecord.extra_fee, extra_description: exitRecord.extra_description,
-                payment_method: exitRecord.payment_method, financial_account_id: exitRecord.financial_account_id,
-                reference_no: exitRecord.reference_no, exit_date: exitRecord.exit_date,
-                items: exitRecord.items.map(i => formatItem(i, false))
-            };
-        } else {
-            const { data: loadItems } = await supabaseAdmin
-                .from("loading_order_items")
-                .select(`*, product:products(id, name, effective_storage_cost, effective_loading_cost, product_categories(fee_type)), clearance_items(created_at, weight)`)
-                .eq("loading_order_id", loadingOrderRecord.id);
+            // دریافت اطلاعات وابسته
+            const [loMap, custMap] = await Promise.all([
+                pickMapById(pool, "loading_orders", [exitRecord.loading_order_id], "*"),
+                pickMapById(pool, "customers", [exitRecord.owner_id], "id,name")
+            ]);
 
-            responseData = {
-                source: 'loading_order', is_processed: false, loading_id: loadingOrderRecord.id,
-                order_no: loadingOrderRecord.order_no, driver_name: loadingOrderRecord.driver_name, plate_number: loadingOrderRecord.plate_number,
-                customer_name: loadingOrderRecord.clearance?.customer?.name, customer_id: loadingOrderRecord.clearance?.customer_id,
-                items: loadItems.map(i => formatItem(i, true))
-            };
+            const { rows: exitItems } = await pool.query(`SELECT * FROM public.warehouse_exit_items WHERE warehouse_exit_id = $1`, [exitRecord.id]);
+
+            const liMap = await pickMapById(pool, "loading_order_items", exitItems.map(i => i.loading_item_id), "*");
+            const prodMap = await pickMapById(pool, "products", Object.values(liMap).map(i => i.product_id), "*");
+
+            const formattedItems = exitItems.map(it => {
+                const li = liMap[it.loading_item_id];
+                const pr = li ? prodMap[li.product_id] : null;
+                return {
+                    item_id: it.loading_item_id,
+                    product_name: pr?.name || "نامشخص",
+                    batch_no: li?.batch_no,
+                    qty: toNum(it.qty),
+                    entry_date: it.created_at, // ساده‌سازی
+                    fee_type: pr?.fee_type || "weight",
+                    base_storage_rate: toNum(pr?.effective_storage_cost),
+                    base_loading_rate: toNum(pr?.effective_loading_cost),
+                    weight_full: toNum(it.weight_full),
+                    weight_empty: toNum(it.weight_empty),
+                    weight_net: toNum(it.weight_net),
+                    row_storage_fee: toNum(it.final_fee),
+                    row_loading_fee: toNum(it.loading_fee),
+                };
+            });
+
+            return res.json({
+                success: true,
+                data: {
+                    source: "exit_record",
+                    is_processed: true,
+                    status: exitRecord.status,
+                    exit_id: exitRecord.id,
+                    loading_id: exitRecord.loading_order_id,
+                    order_no: loMap[exitRecord.loading_order_id]?.order_no,
+                    driver_name: exitRecord.driver_name,
+                    plate_number: exitRecord.plate_number,
+                    customer_name: custMap[exitRecord.owner_id]?.name,
+                    customer_id: exitRecord.owner_id,
+                    weighbridge_fee: exitRecord.weighbridge_fee,
+                    extra_fee: exitRecord.extra_fee,
+                    payment_method: exitRecord.payment_method,
+                    items: formattedItems
+                }
+            });
         }
 
-        return res.json({ success: true, data: responseData });
+        // --- حالت ۲: نمایش loading order برای ثبت خروج جدید ---
+        if (loadingOrderRecord) {
+            const { rows: loadItems } = await pool.query(`SELECT * FROM public.loading_order_items WHERE loading_order_id = $1`, [loadingOrderRecord.id]);
+            const prodMap = await pickMapById(pool, "products", loadItems.map(i => i.product_id), "*");
+
+            const formattedItems = loadItems.map(li => {
+                const pr = prodMap[li.product_id];
+                return {
+                    item_id: li.id,
+                    product_name: pr?.name,
+                    batch_no: li.batch_no,
+                    qty: toNum(li.qty),
+                    entry_date: new Date().toISOString(),
+                    fee_type: pr?.fee_type || "weight",
+                    base_storage_rate: toNum(pr?.effective_storage_cost),
+                    base_loading_rate: toNum(pr?.effective_loading_cost),
+                    weight_full: 0, weight_empty: 0, weight_net: 0,
+                    row_storage_fee: 0, row_loading_fee: 0
+                };
+            });
+
+            return res.json({
+                success: true,
+                data: {
+                    source: "loading_order",
+                    is_processed: false,
+                    loading_id: loadingOrderRecord.id,
+                    order_no: loadingOrderRecord.order_no,
+                    driver_name: loadingOrderRecord.driver_name,
+                    plate_number: loadingOrderRecord.plate_number,
+                    customer_id: loadingOrderRecord.customer_id,
+                    items: formattedItems
+                }
+            });
+        }
 
     } catch (e) {
-        console.error(e);
+        console.error("❌ Search Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
     }
 });
 
-function formatItem(item, isNew) {
-    const ref = isNew ? item : item.loading_item;
-    const product = ref?.product;
-    const clearance = ref?.clearance_items;
-    const entryDate = clearance?.created_at || new Date().toISOString();
-
-    return {
-        item_id: isNew ? item.id : item.loading_item_id,
-        product_name: product?.name || "نامشخص",
-        batch_no: ref?.batch_no,
-        qty: isNew ? (ref?.qty || 0) : (item.qty || 0),
-        entry_date: entryDate,
-        fee_type: product?.product_categories?.fee_type || 'weight',
-        base_storage_rate: Number(product?.effective_storage_cost) || 0,
-        base_loading_rate: Number(product?.effective_loading_cost) || 0,
-        cleared_weight: Number(clearance?.weight) || 0,
-        weight_full: isNew ? 0 : (item.weight_full || 0),
-        weight_empty: isNew ? 0 : (item.weight_empty || 0),
-        weight_net: isNew ? 0 : (item.weight_net || 0),
-        row_storage_fee: isNew ? 0 : (item.final_fee || 0),
-        row_loading_fee: isNew ? 0 : (item.loading_fee || 0)
-    };
-}
-
-// ============================================================
-//  3. ثبت خروج (POST)
-// ============================================================
+/* ============================================================
+   3) POST /api/exits   ثبت خروج (Transactional)
+============================================================ */
 router.post("/", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
-
+        const memberId = req.user.id;
         const payload = req.body;
-        const exitNo = await generateExitNo(numericId);
 
-        const { data: header, error: headErr } = await supabaseAdmin.from("warehouse_exits").insert({
-            member_id: numericId, exit_no: exitNo, loading_order_id: payload.loading_order_id,
-            owner_id: payload.owner_id, driver_name: payload.driver_name, plate_number: payload.plate_number,
-            exit_date: payload.exit_date, reference_no: payload.reference_no, driver_national_code: payload.driver_national_code,
-            weighbridge_fee: Number(payload.weighbridge_fee), extra_fee: Number(payload.extra_fee), extra_description: payload.extra_description,
-            vat_fee: Number(payload.vat_fee), total_fee: Number(payload.total_fee), total_loading_fee: Number(payload.total_loading_fee),
-            payment_method: payload.payment_method, financial_account_id: payload.financial_account_id,
-            status: payload.status, description: payload.status === 'draft' ? 'ثبت موقت' : 'ثبت نهایی'
-        }).select().single();
+        await client.query('BEGIN'); // 🚀 شروع تراکنش
 
-        if (headErr) throw headErr;
+        const exitNo = await generateExitNo(client, memberId);
 
-        const itemsData = payload.items.map(item => ({
-            warehouse_exit_id: header.id, loading_item_id: item.item_id,
-            weight_full: Number(item.weight_full), weight_empty: Number(item.weight_empty), weight_net: Number(item.weight_net),
-            qty: Number(item.qty), fee_type: item.fee_type, fee_price: Number(item.base_storage_rate || 0),
-            loading_fee: Number(item.row_loading_fee || 0), final_fee: Number(item.row_storage_fee || 0)
-        }));
+        // ۱. ثبت هدر
+        const headerQuery = `
+            INSERT INTO public.warehouse_exits (
+                member_id, exit_no, loading_order_id, owner_id, driver_name, plate_number,
+                exit_date, reference_no, driver_national_code, weighbridge_fee, extra_fee, extra_description,
+                vat_fee, total_fee, total_loading_fee, payment_method, financial_account_id, status, description
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+            ) RETURNING *
+        `;
+        const headerValues = [
+            memberId, exitNo, payload.loading_order_id, payload.owner_id, payload.driver_name, payload.plate_number,
+            payload.exit_date, payload.reference_no, payload.driver_national_code,
+            toNum(payload.weighbridge_fee), toNum(payload.extra_fee), payload.extra_description,
+            toNum(payload.vat_fee), toNum(payload.total_fee), toNum(payload.total_loading_fee),
+            payload.payment_method, payload.financial_account_id, payload.status,
+            payload.status === "draft" ? "ثبت موقت" : "ثبت نهایی"
+        ];
 
-        const { error: itemsErr } = await supabaseAdmin.from("warehouse_exit_items").insert(itemsData);
-        if (itemsErr) { await supabaseAdmin.from("warehouse_exits").delete().eq("id", header.id); throw itemsErr; }
+        const { rows: [header] } = await client.query(headerQuery, headerValues);
 
-        if (payload.status === 'final') {
-            await supabaseAdmin.from("loading_orders").update({ status: 'exited' }).eq("id", payload.loading_order_id);
+        // ۲. ثبت آیتم‌ها
+        for (const item of (payload.items || [])) {
+            await client.query(`
+                INSERT INTO public.warehouse_exit_items (
+                    warehouse_exit_id, loading_item_id, weight_full, weight_empty, weight_net,
+                    qty, fee_type, fee_price, loading_fee, final_fee
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            `, [
+                header.id, item.item_id, toNum(item.weight_full), toNum(item.weight_empty), toNum(item.weight_net),
+                toNum(item.qty), item.fee_type || 'weight', toNum(item.base_storage_rate),
+                toNum(item.row_loading_fee), toNum(item.row_storage_fee)
+            ]);
         }
 
-        return res.json({ success: true, id: header.id, message: "ثبت شد" });
+        // ۳. آپدیت وضعیت دستور بارگیری (اگر نهایی بود)
+        if (payload.status === "final" && payload.loading_order_id) {
+            await client.query(`UPDATE public.loading_orders SET status = 'exited' WHERE id = $1`, [payload.loading_order_id]);
+        }
+
+        await client.query('COMMIT'); // ✅ پایان موفق
+
+        return res.json({ success: true, id: header.id, message: "خروج با موفقیت ثبت شد" });
+
     } catch (e) {
-        console.error(e);
+        await client.query('ROLLBACK'); // ❌ بازگشت در صورت خطا
+        console.error("❌ Post Exit Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
-// ============================================================
-//  4. دریافت جزئیات برای پرینت
-//  GET /api/exits/:id
-// ============================================================
+/* ============================================================
+   4) GET /api/exits/:id   جزئیات برای پرینت
+============================================================ */
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
+        const exitId = req.params.id;
+        const memberId = req.user.id;
 
-        const { data, error } = await supabaseAdmin
-            .from("warehouse_exits")
-            .select(`*, customer:customers(name), loading_order:loading_orders(order_no, driver_name, plate_number, clearance:clearances(customer:customers(name))), items:warehouse_exit_items(*, loading_item:loading_order_items(batch_no, qty, product:products(id, name), clearance_item:clearance_items(created_at, weight)))`)
-            .eq("id", req.params.id)
-            .eq("member_id", numericId)
-            .single();
+        const { rows } = await pool.query(
+            `SELECT * FROM public.warehouse_exits WHERE id = $1 AND member_id = $2`,
+            [exitId, memberId]
+        );
 
-        if (error) throw error;
+        if (rows.length === 0) return res.status(404).json({ success: false, error: "سند یافت نشد" });
+        const header = rows[0];
 
-        const formattedItems = data.items.map(item => {
-            const entryDate = item.loading_item?.clearance_item?.created_at || new Date().toISOString();
-            const diffTime = Math.abs(new Date(data.exit_date) - new Date(entryDate));
-            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-            const months = diffDays > 30 ? Math.ceil(diffDays/30) : 1;
+        // دریافت اطلاعات وابسته
+        const [loMap, custMap] = await Promise.all([
+            pickMapById(pool, "loading_orders", [header.loading_order_id], "id,order_no"),
+            pickMapById(pool, "customers", [header.owner_id], "id,name")
+        ]);
 
+        const { rows: exitItems } = await pool.query(
+            `SELECT * FROM public.warehouse_exit_items WHERE warehouse_exit_id = $1`,
+            [header.id]
+        );
+
+        const liMap = await pickMapById(pool, "loading_order_items", exitItems.map(i => i.loading_item_id), "*");
+        const prodMap = await pickMapById(pool, "products", Object.values(liMap).map(i => i.product_id), "id,name");
+
+        const formattedItems = exitItems.map(it => {
+            const li = liMap[it.loading_item_id];
+            const pr = li ? prodMap[li.product_id] : null;
             return {
-                ...item,
-                product_name: item.loading_item?.product?.name,
-                batch_no: item.loading_item?.batch_no,
-                entry_date: entryDate,
-                months_duration: months,
-                weight_net: item.weight_net,
-                cleared_weight: item.loading_item?.clearance_item?.weight,
-                row_storage_fee: item.final_fee
+                ...it,
+                product_name: pr?.name,
+                batch_no: li?.batch_no,
+                row_storage_fee: it.final_fee
             };
         });
 
-        const result = {
-            ...data,
-            customer_name: data.customer?.name || data.loading_order?.clearance?.customer?.name,
-            driver_name: data.driver_name, plate_number: data.plate_number, order_no: data.loading_order?.order_no,
-            items: formattedItems
-        };
+        return res.json({
+            success: true,
+            data: {
+                ...header,
+                customer_name: custMap[header.owner_id]?.name,
+                order_no: loMap[header.loading_order_id]?.order_no,
+                items: formattedItems
+            }
+        });
 
-        return res.json({ success: true, data: result });
-    } catch(e) {
+    } catch (e) {
+        console.error("❌ Get Exit ID Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
     }
 });
 
-// ============================================================
-//  5. حذف سند خروج - ✅ اضافه شد
-//  DELETE /api/exits/:id
-// ============================================================
+/* ============================================================
+   5) DELETE /api/exits/:id   حذف سند خروج (Transactional)
+============================================================ */
 router.delete("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
-
         const exitId = req.params.id;
+        const memberId = req.user.id;
 
-        const { data: exitRecord, error: findErr } = await supabaseAdmin
-            .from("warehouse_exits").select("id, loading_order_id, member_id").eq("id", exitId).single();
+        await client.query('BEGIN');
 
-        if (findErr || !exitRecord) return res.status(404).json({ success: false, error: "سند یافت نشد" });
-        if (exitRecord.member_id !== numericId) return res.status(403).json({ success: false, error: "دسترسی غیرمجاز" });
+        // چک کردن مالکیت
+        const { rows } = await client.query(
+            `SELECT id, loading_order_id FROM public.warehouse_exits WHERE id = $1 AND member_id = $2`,
+            [exitId, memberId]
+        );
+        if (rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: "سند یافت نشد یا دسترسی ندارید" });
+        }
+        const exitRecord = rows[0];
 
-        // حذف آیتم‌ها
-        await supabaseAdmin.from("warehouse_exit_items").delete().eq("warehouse_exit_id", exitId);
+        // ۱. حذف آیتم‌ها
+        await client.query(`DELETE FROM public.warehouse_exit_items WHERE warehouse_exit_id = $1`, [exitId]);
 
-        // حذف هدر
-        const { error: delErr } = await supabaseAdmin.from("warehouse_exits").delete().eq("id", exitId);
-        if (delErr) throw delErr;
+        // ۲. حذف هدر
+        await client.query(`DELETE FROM public.warehouse_exits WHERE id = $1`, [exitId]);
 
-        // آزاد کردن دستور بارگیری (بازگشت به وضعیت issued)
-        await supabaseAdmin.from("loading_orders").update({ status: 'issued' }).eq("id", exitRecord.loading_order_id);
+        // ۳. بازگرداندن وضعیت دستور بارگیری
+        if (exitRecord.loading_order_id) {
+            await client.query(`UPDATE public.loading_orders SET status = 'issued' WHERE id = $1`, [exitRecord.loading_order_id]);
+        }
+
+        await client.query('COMMIT');
 
         return res.json({ success: true, message: "سند حذف شد." });
+
     } catch (e) {
-        console.error(e);
+        await client.query('ROLLBACK');
+        console.error("❌ Delete Exit Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 

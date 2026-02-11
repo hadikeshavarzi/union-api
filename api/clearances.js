@@ -1,3 +1,4 @@
+// api/clearances.js
 const express = require("express");
 const { supabaseAdmin } = require("../supabaseAdmin");
 const authMiddleware = require("./middleware/auth");
@@ -5,121 +6,151 @@ const authMiddleware = require("./middleware/auth");
 const router = express.Router();
 
 /* ============================================================
+   Helpers
+============================================================ */
+function toNumber(v, fallback = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function uniq(arr) {
+    return [...new Set((arr || []).filter((x) => x !== null && x !== undefined))];
+}
+
+// ساخت OR برای eq:  col.eq.1,col.eq.2,...
+function orEqList(col, ids) {
+    const clean = uniq(ids).map((x) => toNumber(x)).filter((x) => Number.isFinite(x));
+    if (!clean.length) return null;
+    return clean.map((id) => `${col}.eq.${id}`).join(",");
+}
+
+/* ============================================================
    Helper: تبدیل UUID به عدد (حل مشکل 22P02)
 ============================================================ */
 async function getNumericMemberId(idInput) {
     if (!idInput) return null;
+
+    // اگر از قبل عددی است
     if (!isNaN(idInput) && !String(idInput).includes("-")) return Number(idInput);
 
+    // اگر UUID است: از members با auth_user_id پیدا کن
     const { data, error } = await supabaseAdmin
-        .from('members')
-        .select('id')
-        .eq('auth_user_id', idInput)
+        .from("members")
+        .select("id")
+        .eq("auth_user_id", idInput)
         .maybeSingle();
 
     if (error) {
         console.error("❌ Database Error in getNumericMemberId:", error.message);
         return null;
     }
-    return data ? data.id : null;
+    return data ? Number(data.id) : null;
 }
 
 /* ============================================================
    Helper: تولید شماره ترخیص اختصاصی
 ============================================================ */
 async function generateClearanceNo(memberId) {
-    const { count } = await supabaseAdmin
+    const { count, error } = await supabaseAdmin
         .from("clearances")
         .select("*", { count: "exact", head: true })
         .eq("member_id", memberId);
 
+    if (error) throw new Error(error.message);
+
     // فرمول: (آیدی انبار * 1000) + سری 200 + (تعداد + 1)
-    return (memberId * 1000) + 200 + (count + 1);
+    return memberId * 1000 + 200 + (toNumber(count) + 1);
 }
 
 /* ============================================================
-   ۱. دریافت لیست کلی محصولات (موجودی لحظه‌ای و دقیق) ✅
+   1) Owner Products Summary
+   - بدون join
+   - بدون in
 ============================================================ */
 router.get("/owner-products/:ownerId", authMiddleware, async (req, res) => {
     try {
-        const owner_id = Number(req.params.ownerId);
-        const uuidOrId = req.user.id;
-        let numericId = await getNumericMemberId(uuidOrId);
-        if (!numericId) numericId = 2; // Fallback
+        const owner_id = toNumber(req.params.ownerId);
+        let member_id = await getNumericMemberId(req.user.id);
+        if (!member_id) member_id = 2; // fallback
 
-        console.log(`🔍 Calculating Summary for Owner: ${owner_id}`);
+        // 1) receipts متعلق به owner/member
+        const { data: receipts, error: recErr } = await supabaseAdmin
+            .from("receipts")
+            .select("id")
+            .eq("owner_id", owner_id)
+            .eq("member_id", member_id);
 
-        // الف) دریافت کل ورودی‌ها (از رسیدها)
-        // نکته: Product را اینجا Join نمیکنیم تا ارور Embed ندهد
-        const { data: receipts, error: rError } = await supabaseAdmin
+        if (recErr) throw new Error(recErr.message);
+
+        const receiptIds = uniq((receipts || []).map((r) => r.id));
+        if (!receiptIds.length) {
+            return res.json({ success: true, data: [] });
+        }
+
+        // 2) receipt_items برای آن receipts (با OR)
+        const orReceipt = orEqList("receipt_id", receiptIds);
+        let itemsQuery = supabaseAdmin
             .from("receipt_items")
-            .select(`product_id, count, weights_net, receipts!inner(owner_id, member_id)`)
-            .eq("receipts.owner_id", owner_id)
-            .eq("receipts.member_id", numericId);
+            .select("receipt_id, product_id, count, weights_net, row_code");
 
-        if (rError) throw rError;
+        if (orReceipt) itemsQuery = itemsQuery.or(orReceipt);
 
-        // ب) دریافت تمام تراکنش‌ها (هم مثبت هم منفی)
-        const { data: transactions, error: tError } = await supabaseAdmin
+        const { data: receiptItems, error: itErr } = await itemsQuery;
+        if (itErr) throw new Error(itErr.message);
+
+        // 3) inventory_transactions برای owner/member
+        const { data: txs, error: txErr } = await supabaseAdmin
             .from("inventory_transactions")
             .select("product_id, qty, weight")
             .eq("owner_id", owner_id)
-            .eq("member_id", numericId);
+            .eq("member_id", member_id);
 
-        if (tError) throw tError;
+        if (txErr) throw new Error(txErr.message);
 
-        // ج) دریافت نام محصولات (کوئری جداگانه و ایمن)
-        const productIds = [...new Set((receipts || []).map(r => r.product_id))];
+        // 4) fetch product names (با OR روی products.id)
+        const productIds = uniq((receiptItems || []).map((x) => x.product_id));
         let productNames = {};
 
-        if (productIds.length > 0) {
-            const { data: productsData } = await supabaseAdmin
-                .from("products")
-                .select("id, name")
-                .in("id", productIds);
+        if (productIds.length) {
+            const orProd = orEqList("id", productIds);
+            let pQuery = supabaseAdmin.from("products").select("id, name");
+            if (orProd) pQuery = pQuery.or(orProd);
 
-            (productsData || []).forEach(p => { productNames[p.id] = p.name; });
+            const { data: prods, error: pErr } = await pQuery;
+            if (pErr) throw new Error(pErr.message);
+
+            (prods || []).forEach((p) => (productNames[p.id] = p.name));
         }
 
-        // د) محاسبه مجموع
-        const productMap = {};
+        // 5) aggregation
+        const map = {};
 
-        // 1. جمع ورودی‌ها
-        (receipts || []).forEach(item => {
-            const pid = item.product_id;
-            if (!productMap[pid]) {
-                productMap[pid] = {
-                    id: pid,
-                    title: productNames[pid] || 'کالای نامشخص',
-                    qty: 0,
-                    weight: 0
+        // ورودی از receipt_items
+        (receiptItems || []).forEach((it) => {
+            const pid = it.product_id;
+            if (!map[pid]) {
+                map[pid] = {
+                    product_id: pid,
+                    product_title: productNames[pid] || "کالای نامشخص",
+                    total_qty_available: 0,
+                    total_weight_available: 0,
                 };
             }
-            productMap[pid].qty += Number(item.count || 0);
-            productMap[pid].weight += Number(item.weights_net || 0);
+            map[pid].total_qty_available += toNumber(it.count);
+            map[pid].total_weight_available += toNumber(it.weights_net);
         });
 
-        // 2. اعمال تراکنش‌ها (جمع جبری: منفی‌ها خودکار کم می‌شوند)
-        (transactions || []).forEach(item => {
-            const pid = item.product_id;
-            if (productMap[pid]) {
-                productMap[pid].qty += Number(item.qty || 0);
-                productMap[pid].weight += Number(item.weight || 0);
-            }
+        // جمع جبری با تراکنش‌ها
+        (txs || []).forEach((tx) => {
+            const pid = tx.product_id;
+            if (!map[pid]) return; // فقط چیزهایی که از receipt فهمیدیم (مثل نسخه خودت)
+            map[pid].total_qty_available += toNumber(tx.qty);
+            map[pid].total_weight_available += toNumber(tx.weight);
         });
 
-        // 3. فیلتر کردن و خروجی
-        const summary = Object.values(productMap)
-            .filter(p => p.qty > 0)
-            .map(p => ({
-                product_id: p.id,
-                product_title: p.title,
-                total_qty_available: p.qty,
-                total_weight_available: p.weight
-            }));
+        const summary = Object.values(map).filter((x) => x.total_qty_available > 0);
 
         return res.json({ success: true, data: summary });
-
     } catch (e) {
         console.error("❌ Owner Products Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
@@ -127,86 +158,94 @@ router.get("/owner-products/:ownerId", authMiddleware, async (req, res) => {
 });
 
 /* ============================================================
-   ۲. دریافت دسته‌های کالا (Batches) - دقیق‌ترین حالت ✅
+   2) Batches
+   - بدون join
+   - بدون in
 ============================================================ */
 router.get("/batches", authMiddleware, async (req, res) => {
     try {
-        const { owner_id, product_id } = req.query;
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
+        const owner_id = toNumber(req.query.owner_id);
+        const product_id = toNumber(req.query.product_id);
+
+        let member_id = await getNumericMemberId(req.user.id);
+        if (!member_id) member_id = 2;
 
         if (!owner_id || !product_id) {
-            return res.status(400).json({ success: false, error: "Missing params" });
+            return res.status(400).json({ success: false, error: "Missing params: owner_id, product_id" });
         }
 
-        console.log(`📦 Fetching Batches for Product: ${product_id}`);
+        // 1) receipts ids
+        const { data: receipts, error: recErr } = await supabaseAdmin
+            .from("receipts")
+            .select("id")
+            .eq("owner_id", owner_id)
+            .eq("member_id", member_id);
 
-        // ۱. دریافت رسیدها (پایه موجودی)
-        const { data: receiptItems, error: rError } = await supabaseAdmin
+        if (recErr) throw new Error(recErr.message);
+
+        const receiptIds = uniq((receipts || []).map((r) => r.id));
+        if (!receiptIds.length) return res.json({ success: true, data: [] });
+
+        // 2) receipt_items for those receipts + product_id
+        const orReceipt = orEqList("receipt_id", receiptIds);
+        let riQuery = supabaseAdmin
             .from("receipt_items")
-            .select(`id, row_code, count, weights_net, receipts!inner (owner_id, member_id)`)
-            .eq("receipts.owner_id", Number(owner_id))
-            .eq("receipts.member_id", numericId)
-            .eq("product_id", Number(product_id));
+            .select("id, receipt_id, product_id, row_code, count, weights_net")
+            .eq("product_id", product_id);
 
-        if (rError) throw rError;
+        if (orReceipt) riQuery = riQuery.or(orReceipt);
 
-        // ۲. دریافت تمام تراکنش‌ها (بدون فیلتر منفی/مثبت)
-        const { data: allTransactions, error: tError } = await supabaseAdmin
+        const { data: receiptItems, error: riErr } = await riQuery;
+        if (riErr) throw new Error(riErr.message);
+
+        // 3) all inventory tx for that owner/product/member
+        const { data: allTx, error: txErr } = await supabaseAdmin
             .from("inventory_transactions")
-            .select("*")
-            .eq("owner_id", Number(owner_id))
-            .eq("member_id", numericId)
-            .eq("product_id", Number(product_id));
+            .select("id, product_id, qty, weight, batch_no, parent_batch_no, ref_type, ref_id, created_at")
+            .eq("owner_id", owner_id)
+            .eq("member_id", member_id)
+            .eq("product_id", product_id);
 
-        if (tError) throw tError;
+        if (txErr) throw new Error(txErr.message);
 
         const result = [];
 
-        (receiptItems || []).forEach(receipt => {
+        (receiptItems || []).forEach((receipt) => {
             const batchName = receipt.row_code || `ID-${receipt.id}`;
 
-            // موجودی اولیه
-            let currentQty = Number(receipt.count || 0);
-            let currentWeight = Number(receipt.weights_net || 0);
+            let currentQty = toNumber(receipt.count);
+            let currentWeight = toNumber(receipt.weights_net);
 
-            // پیدا کردن تراکنش‌های مرتبط (خودش + فرزندانش)
-            const relatedTx = (allTransactions || []).filter(tx =>
-                tx.batch_no && (tx.batch_no === batchName || tx.batch_no.startsWith(batchName + '/'))
-            );
-
-            // ۳. اعمال تغییرات (جمع جبری)
-            // منفی‌ها کم می‌شوند، مثبت‌ها زیاد می‌شوند
-            relatedTx.forEach(tx => {
-                currentQty += Number(tx.qty || 0);
-                currentWeight += Number(tx.weight || 0);
+            const relatedTx = (allTx || []).filter((tx) => {
+                if (!tx.batch_no) return false;
+                return tx.batch_no === batchName || String(tx.batch_no).startsWith(batchName + "/");
             });
 
-            console.log(`   👉 Batch ${batchName} -> Final Stock: ${currentQty}`);
+            relatedTx.forEach((tx) => {
+                currentQty += toNumber(tx.qty);
+                currentWeight += toNumber(tx.weight);
+            });
 
-            // فقط اگر موجودی دارد نشان بده
             if (currentQty > 0) {
-                // آماده‌سازی تاریخچه برای نمایش درختی (تبدیل به مثبت برای نمایش زیبا)
-                const history = relatedTx.map(tx => ({
+                const history = relatedTx.map((tx) => ({
                     ...tx,
-                    display_qty: Math.abs(Number(tx.qty)), // فقط برای نمایش
-                    display_weight: Math.abs(Number(tx.weight)),
-                    qty: Number(tx.qty), // مقدار واقعی حفظ شود
-                    weight: Number(tx.weight),
-                    parent_batch_no: batchName
+                    display_qty: Math.abs(toNumber(tx.qty)),
+                    display_weight: Math.abs(toNumber(tx.weight)),
+                    qty: toNumber(tx.qty),
+                    weight: toNumber(tx.weight),
+                    parent_batch_no: batchName,
                 }));
 
                 result.push({
                     batch_no: batchName,
                     qty_available: currentQty,
                     weight_available: currentWeight,
-                    history: history
+                    history,
                 });
             }
         });
 
         return res.json({ success: true, data: result });
-
     } catch (e) {
         console.error("❌ Batch Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
@@ -214,88 +253,118 @@ router.get("/batches", authMiddleware, async (req, res) => {
 });
 
 /* ============================================================
-   ۳. ثبت ترخیص (POST) - همراه با سینک اتوماتیک ✅
+   3) CREATE Clearance
+   - بدون rpc
+   - به جای rpc: ثبت inventory_transactions (کسر موجودی)
 ============================================================ */
 router.post("/", authMiddleware, async (req, res) => {
     try {
-        const uuidOrId = req.user.id;
-        let numericId = await getNumericMemberId(uuidOrId);
-        if (!numericId) numericId = 2;
+        let member_id = await getNumericMemberId(req.user.id);
+        if (!member_id) member_id = 2;
 
         const {
-            customer_id, clearance_date, receiver_person_name, receiver_person_national_id,
-            driver_name, plate, description, items, doc_type_id = 1
+            customer_id,
+            clearance_date,
+            receiver_person_name,
+            receiver_person_national_id,
+            driver_name,
+            plate,
+            description,
+            items,
+            doc_type_id = 1,
         } = req.body;
 
-        const clearanceNo = await generateClearanceNo(numericId);
+        if (!customer_id) {
+            return res.status(400).json({ success: false, error: "customer_id الزامی است" });
+        }
+        if (!Array.isArray(items) || !items.length) {
+            return res.status(400).json({ success: false, error: "items الزامی است" });
+        }
 
-        // A. ثبت هدر
+        const clearanceNo = await generateClearanceNo(member_id);
+
+        // A) Header
         const { data: clearance, error: hErr } = await supabaseAdmin
             .from("clearances")
             .insert({
-                doc_type_id: doc_type_id,
+                doc_type_id,
                 clearance_no: clearanceNo,
-                member_id: numericId,
-                status: 'final',
+                member_id,
+                status: "final",
                 clearance_date: clearance_date || new Date().toISOString(),
-                customer_id: customer_id,
-                receiver_person_name: receiver_person_name,
-                receiver_person_national_id: receiver_person_national_id,
-                driver_name: driver_name,
+                customer_id,
+                receiver_person_name: receiver_person_name || null,
+                receiver_person_national_id: receiver_person_national_id || null,
+                driver_name: driver_name || null,
                 vehicle_plate_iran_right: plate?.right2 || null,
                 vehicle_plate_mid3: plate?.middle3 || null,
                 vehicle_plate_letter: plate?.letter || null,
                 vehicle_plate_left2: plate?.left2 || null,
-                description: description
+                description: description || null,
             })
-            .select().single();
+            .select()
+            .single();
 
         if (hErr) {
             console.error("❌ Clearance Header Error:", hErr.message);
             return res.status(500).json({ success: false, error: hErr.message });
         }
 
-        // B. ثبت آیتم‌ها
-        const formattedItems = items.map(item => ({
+        // B) Items
+        const formattedItems = items.map((item) => ({
             clearance_id: clearance.id,
-            product_id: item.product_id,
-            owner_id: customer_id,
-            qty: Number(item.qty || 0),
-            weight: Number(item.weight || 0),
+            product_id: toNumber(item.product_id),
+            owner_id: toNumber(customer_id),
+            qty: toNumber(item.qty),
+            weight: toNumber(item.weight),
             parent_batch_no: item.parent_batch_no || null,
             batch_no: item.batch_no || null,
-            status: 'issued'
-            // member_id را حذف کردیم چون ممکن است ستونش در دیتابیس شما نباشد
+            status: "issued",
         }));
 
         const { error: iErr } = await supabaseAdmin.from("clearance_items").insert(formattedItems);
-
         if (iErr) {
-            // Rollback
             await supabaseAdmin.from("clearances").delete().eq("id", clearance.id);
             console.error("❌ Clearance Items Error:", iErr.message);
             return res.status(500).json({ success: false, error: iErr.message });
         }
 
-        // C. سینک موجودی (بسیار مهم)
-        console.log(`🔄 Syncing Inventory for Clearance ID: ${clearance.id}`);
-        const { error: rpcError } = await supabaseAdmin.rpc('sync_clearance_inventory', {
-            p_clearance_id: clearance.id
-        });
+        // C) Inventory Sync (جایگزین rpc)
+        // هر آیتم ترخیص => یک تراکنش منفی در inventory_transactions
+        const nowIso = new Date().toISOString();
+        const txRows = formattedItems.map((it) => ({
+            member_id,
+            owner_id: toNumber(customer_id),
+            product_id: toNumber(it.product_id),
+            qty: -Math.abs(toNumber(it.qty)),
+            weight: -Math.abs(toNumber(it.weight)),
+            batch_no: it.batch_no || it.parent_batch_no || null,
+            parent_batch_no: it.parent_batch_no || null,
+            ref_type: "clearance",
+            ref_id: clearance.id,
+            created_at: nowIso,
+        }));
 
-        if (rpcError) {
-            console.error("❌ Inventory Sync Error:", rpcError.message);
-        } else {
-            console.log("✅ Inventory Synced Successfully!");
+        const { error: txErr } = await supabaseAdmin.from("inventory_transactions").insert(txRows);
+        if (txErr) {
+            // اگر اینجا خطا خورد، ما rollback کامل نمی‌کنیم چون ترخیص ثبت شده
+            // ولی حداقل گزارش دقیق می‌دهیم
+            console.error("❌ Inventory Sync Error:", txErr.message);
+            return res.status(500).json({
+                success: false,
+                error: "ترخیص ثبت شد اما کسر موجودی ناموفق بود",
+                details: txErr.message,
+                id: clearance.id,
+                clearance_no: clearanceNo,
+            });
         }
 
         return res.json({
             success: true,
             clearance_no: clearanceNo,
             id: clearance.id,
-            message: "سند ترخیص با موفقیت ثبت و موجودی کسر شد."
+            message: "سند ترخیص با موفقیت ثبت و موجودی کسر شد.",
         });
-
     } catch (e) {
         console.error("❌ Server Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
@@ -303,26 +372,87 @@ router.post("/", authMiddleware, async (req, res) => {
 });
 
 /* ============================================================
-   ۴. گزارشات (GET)
+   4) REPORT
+   - بدون join/embed
 ============================================================ */
 router.get("/report", authMiddleware, async (req, res) => {
     try {
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
+        let member_id = await getNumericMemberId(req.user.id);
+        if (!member_id) member_id = 2;
 
-        const { data, error } = await supabaseAdmin
+        // 1) clearances
+        const { data: clearances, error: cErr } = await supabaseAdmin
             .from("clearances")
-            .select(`
-                *,
-                customer:customers (id, name),
-                clearance_items ( *, product:products (id, name) )
-            `)
-            .eq("member_id", numericId)
+            .select("*")
+            .eq("member_id", member_id)
             .order("clearance_date", { ascending: false });
 
-        if (error) throw error;
-        return res.json({ success: true, data });
-    } catch (e) { return res.status(500).json({ success: false, error: e.message }); }
+        if (cErr) throw new Error(cErr.message);
+
+        const clearanceIds = uniq((clearances || []).map((c) => c.id));
+        const customerIds = uniq((clearances || []).map((c) => c.customer_id));
+
+        // 2) customers map
+        let customersMap = {};
+        if (customerIds.length) {
+            const orCust = orEqList("id", customerIds);
+            let custQ = supabaseAdmin.from("customers").select("id, name");
+            if (orCust) custQ = custQ.or(orCust);
+
+            const { data: customers, error: cuErr } = await custQ;
+            if (cuErr) throw new Error(cuErr.message);
+
+            (customers || []).forEach((c) => (customersMap[c.id] = c));
+        }
+
+        // 3) clearance_items
+        let items = [];
+        if (clearanceIds.length) {
+            const orClr = orEqList("clearance_id", clearanceIds);
+            let itQ = supabaseAdmin.from("clearance_items").select("*");
+            if (orClr) itQ = itQ.or(orClr);
+
+            const { data: its, error: iErr } = await itQ;
+            if (iErr) throw new Error(iErr.message);
+
+            items = its || [];
+        }
+
+        // 4) products map
+        const productIds = uniq(items.map((i) => i.product_id));
+        let productsMap = {};
+        if (productIds.length) {
+            const orProd = orEqList("id", productIds);
+            let pQ = supabaseAdmin.from("products").select("id, name");
+            if (orProd) pQ = pQ.or(orProd);
+
+            const { data: prods, error: pErr } = await pQ;
+            if (pErr) throw new Error(pErr.message);
+
+            (prods || []).forEach((p) => (productsMap[p.id] = p));
+        }
+
+        // 5) assemble
+        const itemsByClearance = {};
+        items.forEach((it) => {
+            const cid = it.clearance_id;
+            if (!itemsByClearance[cid]) itemsByClearance[cid] = [];
+            itemsByClearance[cid].push({
+                ...it,
+                product: productsMap[it.product_id] || null,
+            });
+        });
+
+        const out = (clearances || []).map((c) => ({
+            ...c,
+            customer: customersMap[c.customer_id] || null,
+            clearance_items: itemsByClearance[c.id] || [],
+        }));
+
+        return res.json({ success: true, data: out });
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 module.exports = router;

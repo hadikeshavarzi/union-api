@@ -1,38 +1,68 @@
+// api/treasury/operations.js
 const express = require("express");
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const { pool } = require("../../supabaseAdmin");
 const authMiddleware = require("../middleware/auth");
-const { generateDocNo, getNumericMemberId, findMoeinIdByCode } = require("./helpers");
 
 const router = express.Router();
 
+// تابع کمکی داخلی برای پیدا کردن ID معین بر اساس کد
+const findMoeinId = async (client, code) => {
+    const res = await client.query('SELECT id FROM public.accounting_moein WHERE code = $1 LIMIT 1', [code]);
+    return res.rows.length > 0 ? res.rows[0].id : null;
+};
+
+// تابع تولید شماره سند (Max + 1)
+const generateDocNo = async (client, member_id) => {
+    const res = await client.query(
+        'SELECT MAX(doc_no::INTEGER) as max_no FROM public.financial_documents WHERE member_id = $1',
+        [member_id]
+    );
+    const max = res.rows[0].max_no || 1000;
+    return (Number(max) + 1).toString();
+};
+
+/* REGISTER EXIT DOC (ثبت سند خروج) */
 router.post("/register-exit-doc", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+
     try {
         const { exit_id } = req.body;
         const targetExitId = exit_id || req.body.exitId;
+        const member_id = req.user.id;
 
         if (!targetExitId) return res.status(400).json({ success: false, error: "شناسه خروج ارسال نشده است." });
 
-        let numericId = await getNumericMemberId(req.user.id);
-        if (!numericId) numericId = 2;
+        await client.query('BEGIN'); // شروع تراکنش 🚀
 
-        // 1. دریافت سند خروج
-        const { data: exitRecord, error: exitErr } = await supabaseAdmin
-            .from("warehouse_exits").select("*").eq("id", targetExitId).single();
+        // ۱. دریافت اطلاعات خروج
+        const exitQuery = `
+            SELECT * FROM public.warehouse_exits 
+            WHERE id = $1 AND member_id = $2
+        `;
+        const exitRes = await client.query(exitQuery, [targetExitId, member_id]);
 
-        if (exitErr || !exitRecord) return res.status(404).json({ success: false, error: "سند خروج یافت نشد." });
+        if (exitRes.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: "سند خروج یافت نشد." });
+        }
+        const exitRecord = exitRes.rows[0];
 
         if (exitRecord.accounting_doc_id) {
+            await client.query('ROLLBACK');
             return res.json({ success: true, doc_id: exitRecord.accounting_doc_id, message: "سند قبلاً صادر شده است." });
         }
 
-        // محاسبه مجموع کل بدهی
+        // ۲. محاسبه مبالغ
         const totalAmount = Number(exitRecord.total_fee || 0) +
             Number(exitRecord.total_loading_fee || 0) +
             Number(exitRecord.weighbridge_fee || 0) +
             Number(exitRecord.extra_fee || 0) +
             Number(exitRecord.vat_fee || 0);
 
-        if (totalAmount <= 0) return res.json({ success: true, message: "مبلغ صفر است، سند صادر نشد." });
+        if (totalAmount <= 0) {
+            await client.query('ROLLBACK');
+            return res.json({ success: true, message: "مبلغ صفر است، سند صادر نشد." });
+        }
 
         // ==========================================
         //  الف) آماده‌سازی سمت بدهکار (Debtor)
@@ -40,156 +70,139 @@ router.post("/register-exit-doc", authMiddleware, async (req, res) => {
         let debtorEntry = null;
 
         if (exitRecord.payment_method === 'credit') {
-            // --- نسیه (بدهکار: مشتری - کد 10301) ---
-            const moeinId = await findMoeinIdByCode("10301");
-            if (!exitRecord.owner_id) return res.status(400).json({ success: false, error: "صاحب کالا مشخص نیست." });
+            // نسیه: مشتری (10301)
+            const moeinId = await findMoeinId(client, "10301");
 
-            const { data: customer } = await supabaseAdmin.from("customers").select("tafsili_id, name").eq("id", exitRecord.owner_id).single();
-            if (!customer?.tafsili_id) return res.status(400).json({ success: false, error: "حساب تفصیلی مشتری یافت نشد." });
+            // پیدا کردن تفصیلی مشتری
+            const custRes = await client.query(
+                'SELECT tafsili_id FROM public.customers WHERE id = $1',
+                [exitRecord.owner_id]
+            );
+
+            if (custRes.rows.length === 0 || !custRes.rows[0].tafsili_id) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ success: false, error: "حساب تفصیلی مشتری یافت نشد." });
+            }
 
             debtorEntry = {
                 moein_id: moeinId,
-                tafsili_id: customer.tafsili_id,
+                tafsili_id: custRes.rows[0].tafsili_id,
                 bed: totalAmount,
                 bes: 0,
-                description: `بابت خدمات خروج شماره ${exitRecord.exit_no}` // طبق دیتای شما
+                description: `بابت خدمات خروج شماره ${exitRecord.exit_no || '-'}`
             };
 
         } else {
-            // --- نقدی/کارتخوان (بدهکار: صندوق 10101 / کارتخوان 10104) ---
+            // نقدی/کارتخوان
             const tafsiliId = exitRecord.financial_account_id;
-            if (!tafsiliId) return res.status(400).json({ success: false, error: "حساب بانک/صندوق انتخاب نشده." });
+            if (!tafsiliId) {
+                await client.query('ROLLBACK');
+                return res.status(400).json({ success: false, error: "حساب بانک/صندوق انتخاب نشده." });
+            }
 
-            let moeinCode = "10103"; // پیش‌فرض بانک
+            let moeinCode = "10103"; // بانک
             if (exitRecord.payment_method === 'cash') moeinCode = "10101"; // صندوق
-            else if (exitRecord.payment_method === 'pos') moeinCode = "10104"; // موجودی نزد کارتخوان (طبق دیتای شما)
+            else if (exitRecord.payment_method === 'pos') moeinCode = "10104"; // کارتخوان
 
-            const moeinId = await findMoeinIdByCode(moeinCode);
+            const moeinId = await findMoeinId(client, moeinCode);
 
             debtorEntry = {
                 moein_id: moeinId,
                 tafsili_id: tafsiliId,
                 bed: totalAmount,
                 bes: 0,
-                description: `دریافت وجه بابت خروج ${exitRecord.exit_no}`
+                description: `دریافت وجه بابت خروج ${exitRecord.exit_no || '-'}`
             };
         }
 
         // ==========================================
-        //  ب) آماده‌سازی سمت بستانکار (Creditors - Split)
-        //  طبق دیتای شما باید تفکیک شود
+        //  ب) آماده‌سازی سمت بستانکار (Creditors)
         // ==========================================
         const creditorEntries = [];
 
-        // 1. درآمد انبارداری (کد 60101 - معین ۱۰)
-        if (Number(exitRecord.total_fee) > 0) {
-            const mId = await findMoeinIdByCode("60101");
-            creditorEntries.push({
-                moein_id: mId,
-                tafsili_id: null,
-                bed: 0,
-                bes: Number(exitRecord.total_fee),
-                description: "درآمد انبارداری"
-            });
-        }
+        const feeMap = [
+            { amount: exitRecord.total_fee, code: "60101", desc: "درآمد انبارداری" },
+            { amount: exitRecord.total_loading_fee, code: "60102", desc: "درآمد بارگیری" },
+            { amount: exitRecord.weighbridge_fee, code: "60103", desc: "درآمد باسکول" },
+            { amount: exitRecord.extra_fee, code: "60104", desc: "سایر درآمدهای عملیاتی" },
+            { amount: exitRecord.vat_fee, code: "30201", desc: "مالیات بر ارزش افزوده" }
+        ];
 
-        // 2. درآمد بارگیری (کد 60102 - معین ۱۱)
-        if (Number(exitRecord.total_loading_fee) > 0) {
-            const mId = await findMoeinIdByCode("60102");
-            creditorEntries.push({
-                moein_id: mId,
-                tafsili_id: null,
-                bed: 0,
-                bes: Number(exitRecord.total_loading_fee),
-                description: "درآمد بارگیری"
-            });
-        }
-
-        // 3. درآمد باسکول (کد 60103 - معین ۱۲)
-        if (Number(exitRecord.weighbridge_fee) > 0) {
-            const mId = await findMoeinIdByCode("60103");
-            creditorEntries.push({
-                moein_id: mId,
-                tafsili_id: null,
-                bed: 0,
-                bes: Number(exitRecord.weighbridge_fee),
-                description: "درآمد باسکول"
-            });
-        }
-
-        // 4. سایر درآمدها (کد 60104 - معین ۱۳)
-        if (Number(exitRecord.extra_fee) > 0) {
-            const mId = await findMoeinIdByCode("60104");
-            creditorEntries.push({
-                moein_id: mId,
-                tafsili_id: null,
-                bed: 0,
-                bes: Number(exitRecord.extra_fee),
-                description: "سایر درآمدهای عملیاتی"
-            });
-        }
-
-        // 5. مالیات بر ارزش افزوده (کد 30201 - معین ۸)
-        if (Number(exitRecord.vat_fee) > 0) {
-            const mId = await findMoeinIdByCode("30201");
-            creditorEntries.push({
-                moein_id: mId,
-                tafsili_id: null,
-                bed: 0,
-                bes: Number(exitRecord.vat_fee),
-                description: "مالیات بر ارزش افزوده"
-            });
+        for (const item of feeMap) {
+            if (Number(item.amount) > 0) {
+                const mId = await findMoeinId(client, item.code);
+                if (mId) {
+                    creditorEntries.push({
+                        moein_id: mId,
+                        tafsili_id: null,
+                        bed: 0,
+                        bes: Number(item.amount),
+                        description: item.desc
+                    });
+                }
+            }
         }
 
         // ==========================================
         //  ج) ثبت نهایی در دیتابیس
         // ==========================================
 
-        // 1. ثبت هدر سند
-        const docNo = await generateDocNo(numericId);
+        // ۱. ساخت هدر سند
+        const docNo = await generateDocNo(client, member_id);
         const docDate = exitRecord.exit_date || new Date().toISOString();
 
-        const { data: finDoc, error: docErr } = await supabaseAdmin
-            .from("financial_documents")
-            .insert({
-                member_id: numericId,
-                doc_no: docNo,
-                doc_date: docDate,
-                description: `بابت خدمات خروج شماره ${exitRecord.exit_no} - ${exitRecord.driver_name}`,
-                status: 'confirmed',
-                doc_type: 'auto'
-            })
-            .select().single();
+        const insertDocQuery = `
+            INSERT INTO public.financial_documents 
+            (member_id, doc_no, doc_date, description, status, doc_type)
+            VALUES ($1, $2, $3, $4, 'confirmed', 'auto')
+            RETURNING id
+        `;
 
-        if (docErr) throw docErr;
+        const docDesc = `بابت خدمات خروج شماره ${exitRecord.exit_no || ''} - ${exitRecord.driver_name || ''}`;
+        const docRes = await client.query(insertDocQuery, [member_id, docNo, docDate, docDesc]);
+        const newDocId = docRes.rows[0].id;
 
-        // 2. آماده‌سازی آرایه نهایی برای اینسرت
-        const finalEntries = [debtorEntry, ...creditorEntries].map(entry => ({
-            doc_id: finDoc.id,       // ✅ اتصال به هدر
-            member_id: numericId,    // ✅ شناسه ممبر
-            moein_id: entry.moein_id,
-            tafsili_id: entry.tafsili_id,
-            bed: entry.bed,
-            bes: entry.bes,
-            description: entry.description
-        }));
+        // ۲. ثبت آرتیکل‌ها
+        const allEntries = [debtorEntry, ...creditorEntries];
 
-        // 3. اینسرت آرتیکل‌ها
-        const { error: entryErr } = await supabaseAdmin.from("financial_entries").insert(finalEntries);
-
-        if (entryErr) {
-            await supabaseAdmin.from("financial_documents").delete().eq("id", finDoc.id);
-            throw entryErr;
+        for (const entry of allEntries) {
+            await client.query(`
+                INSERT INTO public.financial_entries 
+                (doc_id, member_id, moein_id, tafsili_id, bed, bes, description)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `, [
+                newDocId,
+                member_id,
+                entry.moein_id,
+                entry.tafsili_id,
+                entry.bed,
+                entry.bes,
+                entry.description
+            ]);
         }
 
-        // 4. آپدیت خروجی
-        await supabaseAdmin.from("warehouse_exits").update({ accounting_doc_id: finDoc.id }).eq("id", targetExitId);
+        // ۳. آپدیت رکورد خروج با آیدی سند جدید
+        await client.query(`
+            UPDATE public.warehouse_exits 
+            SET accounting_doc_id = $1 
+            WHERE id = $2
+        `, [newDocId, targetExitId]);
 
-        return res.json({ success: true, doc_id: finDoc.id, doc_no: docNo, message: "سند حسابداری با ریز اقلام صادر شد." });
+        await client.query('COMMIT'); // پایان موفقیت‌آمیز ✅
+
+        return res.json({
+            success: true,
+            doc_id: newDocId,
+            doc_no: docNo,
+            message: "سند حسابداری با موفقیت صادر شد."
+        });
 
     } catch (e) {
+        await client.query('ROLLBACK'); // بازگشت تغییرات در صورت خطا ❌
         console.error("❌ Register Doc Error:", e);
         return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 

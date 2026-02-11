@@ -1,4 +1,4 @@
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const { pool, supabaseAdmin } = require("../../supabaseAdmin");
 
 const getNumericMemberId = async (authUserId) => {
     if (!authUserId) return null;

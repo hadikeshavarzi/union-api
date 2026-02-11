@@ -1,182 +1,78 @@
-// api/treasury/checkbooks.js
 const express = require("express");
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const router = express.Router();
+const { pool } = require("../../supabaseAdmin");
 const authMiddleware = require("../middleware/auth");
 
-const router = express.Router();
-
-/* GET ALL CHECKBOOKS */
+// 1. لیست دسته‌چک‌ها (GET)
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const { status, bank_id } = req.query;
         const member_id = req.user.id;
+        const { bank_id } = req.query;
 
-        let query = supabaseAdmin
-            .from("treasury_checkbooks")
-            .select(`
-                *,
-                treasury_banks(id, bank_name, account_no, branch_name)
-            `)
-            .eq("member_id", member_id) // ✅ فیلتر تنانت
-            .order("created_at", { ascending: false });
-
-        if (status) {
-            query = query.eq("status", status);
-        }
+        let sql = `
+            SELECT tc.*, 
+                   json_build_object('id', tb.id, 'bank_name', tb.bank_name, 'account_no', tb.account_no) as treasury_banks
+            FROM public.treasury_checkbooks tc
+            LEFT JOIN public.treasury_banks tb ON tc.bank_id = tb.id
+            WHERE tc.member_id = $1
+        `;
+        const params = [member_id];
 
         if (bank_id) {
-            query = query.eq("bank_id", bank_id);
+            sql += " AND tc.bank_id = $2";
+            params.push(bank_id);
         }
 
-        const { data, error } = await query;
+        sql += " ORDER BY tc.created_at DESC";
 
-        if (error) throw error;
-
-        return res.json({ success: true, data });
+        const { rows } = await pool.query(sql, params);
+        res.json({ success: true, data: rows });
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+        console.error("❌ GET Checkbooks Error:", e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* GET ONE CHECKBOOK */
-router.get("/:id", authMiddleware, async (req, res) => {
-    try {
-        const { data, error } = await supabaseAdmin
-            .from("treasury_checkbooks")
-            .select(`
-                *,
-                treasury_banks(id, bank_name, account_no, branch_name)
-            `)
-            .eq("id", req.params.id)
-            .eq("member_id", req.user.id)
-            .single();
-
-        if (error || !data) {
-            return res.status(404).json({
-                success: false,
-                error: "دسته‌چک یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        return res.json({ success: true, data });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* CREATE CHECKBOOK */
+// 2. ایجاد دسته‌چک جدید (POST)
 router.post("/", authMiddleware, async (req, res) => {
     try {
         const member_id = req.user.id;
+        const { bank_id, serial_start, serial_end, description } = req.body;
 
-        const payload = {
-            ...req.body,
-            member_id,
-            current_serial: req.body.serial_start,
-            status: 'active'
-        };
-
-        delete payload.id;
-        delete payload.created_at;
-
-        if (!payload.bank_id || !payload.serial_start || !payload.serial_end) {
-            return res.status(400).json({
-                success: false,
-                error: "بانک و سریال شروع و پایان الزامی است"
-            });
+        if (!bank_id || !serial_start || !serial_end) {
+            return res.status(400).json({ success: false, error: "بانک و بازه سریال الزامی است" });
         }
 
-        // چک اینکه bank_id متعلق به این member باشه
-        const { data: bank } = await supabaseAdmin
-            .from("treasury_banks")
-            .select("id")
-            .eq("id", payload.bank_id)
-            .eq("member_id", member_id)
-            .single();
+        const sql = `
+            INSERT INTO public.treasury_checkbooks (
+                member_id, bank_id, serial_start, serial_end, current_serial, status, description, created_at
+            ) VALUES ($1, $2, $3, $4, $3, 'active', $5, NOW())
+            RETURNING *
+        `;
 
-        if (!bank) {
-            return res.status(403).json({
-                success: false,
-                error: "بانک انتخابی یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        const { data, error } = await supabaseAdmin
-            .from("treasury_checkbooks")
-            .insert([payload])
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        return res.json({
-            success: true,
-            data,
-            message: "دسته‌چک با موفقیت ایجاد شد"
-        });
+        const { rows } = await pool.query(sql, [member_id, bank_id, serial_start, serial_end, description]);
+        res.json({ success: true, data: rows[0], message: "دسته‌چک با موفقیت ثبت شد" });
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* UPDATE CHECKBOOK */
-router.put("/:id", authMiddleware, async (req, res) => {
-    try {
-        const payload = { ...req.body };
-        delete payload.id;
-        delete payload.member_id;
-        delete payload.created_at;
-
-        const { data, error } = await supabaseAdmin
-            .from("treasury_checkbooks")
-            .update(payload)
-            .eq("id", req.params.id)
-            .eq("member_id", req.user.id)
-            .select()
-            .single();
-
-        if (error || !data) {
-            return res.status(404).json({
-                success: false,
-                error: "دسته‌چک یافت نشد یا دسترسی ندارید"
-            });
-        }
-
-        return res.json({
-            success: true,
-            data,
-            message: "دسته‌چک با موفقیت ویرایش شد"
-        });
-    } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-/* DELETE CHECKBOOK */
+// 3. حذف دسته‌چک (DELETE)
 router.delete("/:id", authMiddleware, async (req, res) => {
     try {
-        const { error } = await supabaseAdmin
-            .from("treasury_checkbooks")
-            .delete()
-            .eq("id", req.params.id)
-            .eq("member_id", req.user.id);
+        const id = parseInt(req.params.id);
+        const member_id = req.user.id;
 
-        if (error) {
-            if (error.code === '23503') {
-                return res.status(409).json({
-                    success: false,
-                    error: "امکان حذف وجود ندارد (دسته‌چک دارای چک صادر شده)"
-                });
-            }
-            throw error;
-        }
+        const { rowCount } = await pool.query(
+            "DELETE FROM public.treasury_checkbooks WHERE id = $1 AND member_id = $2",
+            [id, member_id]
+        );
 
-        return res.json({
-            success: true,
-            message: "دسته‌چک با موفقیت حذف شد"
-        });
+        if (rowCount === 0) return res.status(404).json({ success: false, error: "دسته‌چک یافت نشد" });
+        res.json({ success: true, message: "حذف شد" });
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+        if (e.code === '23503') return res.status(409).json({ success: false, error: "این دسته‌چک دارای چک صادر شده است" });
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 

@@ -1,210 +1,316 @@
-// api/productUnits.js
+// api/productUnits.js - SQL Based (Postgres) - COMPLETE
 const express = require("express");
-const { supabaseAdmin } = require("../supabaseAdmin");
-
-// 👇 اصلاح شد: حذف {} و اصلاح مسیر به ../middleware/auth
 const authMiddleware = require("./middleware/auth");
+const { pool } = require("../supabaseAdmin"); // ✅ فقط pool
 
 const router = express.Router();
 
+/* =====================================================================
+   UTIL: Normalize
+===================================================================== */
+function normalizeUnit(body = {}) {
+    const out = {
+        name: body.name?.trim() || null,
+        symbol: body.symbol?.trim() || null,
+        // اگر فیلدهای دیگری دارید همینجا whitelist کنید
+    };
+    return out;
+}
+
 /* ============================================================================
-   📌 GET ALL – دریافت همه واحدها (Public)
+   GET ALL – دریافت همه واحدها (Public)
+   Query:
+     - limit (default 100, max 2000)
+     - search (ILIKE on name/symbol)
 ============================================================================ */
 router.get("/", async (req, res) => {
     try {
-        const { limit = 100, search } = req.query;
+        const { limit: limitRaw = 100, search } = req.query;
+        const limit = Math.min(Math.max(parseInt(limitRaw, 10) || 100, 1), 2000);
 
-        let query = supabaseAdmin
-            .from("product_units")
-            .select("*", { count: "exact" })
-            .order("id", { ascending: true });
+        const params = [];
+        let where = "WHERE 1=1";
 
-        // Search
-        if (search) {
-            query = query.or(`name.ilike.%${search}%,symbol.ilike.%${search}%`);
+        if (search && String(search).trim()) {
+            const s = `%${String(search).trim()}%`;
+            params.push(s);
+            params.push(s);
+            where += ` AND (name ILIKE $${params.length - 1} OR symbol ILIKE $${params.length})`;
         }
 
-        // Limit
-        if (limit) {
-            query = query.limit(Number(limit));
-        }
+        // count
+        const countSql = `SELECT COUNT(*)::bigint AS total FROM product_units ${where}`;
+        const countRes = await pool.query(countSql, params);
+        const total = Number(countRes.rows?.[0]?.total || 0);
 
-        const { data, error, count } = await query;
-
-        if (error) {
-            console.error("❌ Fetch Error:", error);
-            return res.status(400).json({
-                success: false,
-                error: error.message
-            });
-        }
+        // data
+        params.push(limit);
+        const dataSql = `
+      SELECT *
+      FROM product_units
+      ${where}
+      ORDER BY id ASC
+      LIMIT $${params.length}
+    `;
+        const dataRes = await pool.query(dataSql, params);
 
         return res.json({
             success: true,
-            data,
-            total: count
+            data: dataRes.rows || [],
+            total,
+            limit,
         });
-
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message
-        });
+        console.error("❌ GET Units Error:", e);
+        return res.status(500).json({ success: false, error: e.message });
     }
 });
 
 /* ============================================================================
-   📌 GET ONE – دریافت یک واحد (Public)
+   GET ONE – دریافت یک واحد (Public)
 ============================================================================ */
 router.get("/:id", async (req, res) => {
     try {
-        const { id } = req.params;
-
-        const { data, error } = await supabaseAdmin
-            .from("product_units")
-            .select("*")
-            .eq("id", id)
-            .single();
-
-        if (error) {
-            return res.status(404).json({
-                success: false,
-                error: "واحد یافت نشد"
-            });
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ success: false, error: "Invalid unit id" });
         }
 
-        return res.json({ success: true, data });
+        const sql = `SELECT * FROM product_units WHERE id = $1 LIMIT 1`;
+        const r = await pool.query(sql, [id]);
 
+        const row = r.rows?.[0];
+        if (!row) {
+            return res.status(404).json({ success: false, error: "واحد یافت نشد" });
+        }
+
+        return res.json({ success: true, data: row });
     } catch (e) {
-        return res.status(500).json({
-            success: false,
-            error: e.message
-        });
+        console.error("❌ GET Unit Error:", e);
+        return res.status(500).json({ success: false, error: e.message });
     }
 });
 
 /* ============================================================================
-   📌 CREATE – ایجاد واحد جدید (Protected)
+   CREATE – ایجاد واحد جدید (Protected)
 ============================================================================ */
 router.post("/", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        const body = req.body;
+        const payload = normalizeUnit(req.body);
 
-        if (!body.name || !body.symbol) {
+        if (!payload.name || !payload.symbol) {
             return res.status(400).json({
                 success: false,
-                error: "نام و نماد واحد الزامی است"
+                error: "نام و نماد واحد الزامی است",
             });
         }
 
-        const { data, error } = await supabaseAdmin
-            .from("product_units")
-            .insert(body)
-            .select()
-            .single();
+        await client.query("BEGIN");
 
-        if (error) {
-            console.error("❌ Insert Error:", error);
-            return res.status(400).json({
-                success: false,
-                error: error.message
-            });
-        }
+        const sql = `
+      INSERT INTO product_units (
+        name, symbol, created_at, updated_at
+      )
+      VALUES (
+        $1, $2, NOW(), NOW()
+      )
+      RETURNING *
+    `;
+
+        const r = await client.query(sql, [payload.name, payload.symbol]);
+
+        await client.query("COMMIT");
 
         return res.json({
             success: true,
-            data,
-            message: "واحد با موفقیت ایجاد شد"
+            data: r.rows[0],
+            message: "واحد با موفقیت ایجاد شد",
         });
-
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message
-        });
+        await client.query("ROLLBACK");
+        console.error("❌ CREATE Unit Error:", e);
+
+        // اگر name یا symbol یونیک باشد
+        if (e?.code === "23505") {
+            return res.status(409).json({
+                success: false,
+                error: "نام یا نماد واحد تکراری است",
+            });
+        }
+
+        return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
 /* ============================================================================
-   📌 UPDATE – ویرایش واحد (Protected)
+   UPDATE – ویرایش واحد (Protected)
 ============================================================================ */
 router.put("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        const { id } = req.params;
-        const body = req.body;
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ success: false, error: "Invalid unit id" });
+        }
 
-        const { data, error } = await supabaseAdmin
-            .from("product_units")
-            .update(body)
-            .eq("id", id)
-            .select()
-            .single();
+        const payload = normalizeUnit(req.body);
 
-        if (error) {
-            console.error("❌ Update Error:", error);
+        if (!payload.name || !payload.symbol) {
             return res.status(400).json({
                 success: false,
-                error: error.message
+                error: "نام و نماد واحد الزامی است",
             });
         }
 
+        await client.query("BEGIN");
+
+        const sql = `
+      UPDATE product_units
+      SET
+        name = $1,
+        symbol = $2,
+        updated_at = NOW()
+      WHERE id = $3
+      RETURNING *
+    `;
+
+        const r = await client.query(sql, [payload.name, payload.symbol, id]);
+
+        if (!r.rows?.length) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ success: false, error: "واحد یافت نشد" });
+        }
+
+        await client.query("COMMIT");
+
         return res.json({
             success: true,
-            data,
-            message: "واحد با موفقیت بروزرسانی شد"
+            data: r.rows[0],
+            message: "واحد با موفقیت بروزرسانی شد",
         });
-
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message
-        });
+        await client.query("ROLLBACK");
+        console.error("❌ UPDATE Unit Error:", e);
+
+        if (e?.code === "23505") {
+            return res.status(409).json({
+                success: false,
+                error: "نام یا نماد واحد تکراری است",
+            });
+        }
+
+        return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
 /* ============================================================================
-   📌 DELETE – حذف واحد (Protected)
+   PATCH – تغییر جزئی (Protected)  (اختیاری ولی خیلی کاربردی)
+============================================================================ */
+router.patch("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ success: false, error: "Invalid unit id" });
+        }
+
+        const body = req.body || {};
+        delete body.id;
+        delete body.created_at;
+        delete body.updated_at;
+
+        const allowed = new Set(["name", "symbol"]);
+        const keys = Object.keys(body).filter(k => allowed.has(k));
+
+        if (!keys.length) {
+            return res.json({ success: true, message: "فیلد مجاز برای تغییر ارسال نشده است" });
+        }
+
+        const setParts = [];
+        const params = [];
+        let idx = 1;
+
+        for (const k of keys) {
+            let v = body[k];
+            if (typeof v === "string") v = v.trim();
+            params.push(v);
+            setParts.push(`${k} = $${idx++}`);
+        }
+
+        setParts.push(`updated_at = NOW()`);
+        params.push(id);
+
+        await client.query("BEGIN");
+
+        const sql = `
+      UPDATE product_units
+      SET ${setParts.join(", ")}
+      WHERE id = $${idx}
+      RETURNING *
+    `;
+        const r = await client.query(sql, params);
+
+        if (!r.rows?.length) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ success: false, error: "واحد یافت نشد" });
+        }
+
+        await client.query("COMMIT");
+        return res.json({ success: true, data: r.rows[0] });
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("❌ PATCH Unit Error:", e);
+
+        if (e?.code === "23505") {
+            return res.status(409).json({ success: false, error: "نام یا نماد واحد تکراری است" });
+        }
+
+        return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+/* ============================================================================
+   DELETE – حذف واحد (Protected)
 ============================================================================ */
 router.delete("/:id", authMiddleware, async (req, res) => {
     try {
-        const { id } = req.params;
-
-        const { error } = await supabaseAdmin
-            .from("product_units")
-            .delete()
-            .eq("id", id);
-
-        // Foreign key violation
-        if (error?.code === "23503") {
-            return res.status(409).json({
-                success: false,
-                error: "امکان حذف این واحد وجود ندارد",
-                message: "این واحد در محصولات استفاده شده است"
-            });
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isFinite(id)) {
+            return res.status(400).json({ success: false, error: "Invalid unit id" });
         }
 
-        if (error) {
-            console.error("❌ Delete Error:", error);
-            return res.status(400).json({
-                success: false,
-                error: error.message
-            });
+        try {
+            const r = await pool.query(
+                `DELETE FROM product_units WHERE id = $1 RETURNING id`,
+                [id]
+            );
+
+            if (!r.rows?.length) {
+                return res.status(404).json({ success: false, error: "واحد یافت نشد" });
+            }
+        } catch (err) {
+            // Foreign key violation
+            if (err?.code === "23503") {
+                return res.status(409).json({
+                    success: false,
+                    error: "امکان حذف این واحد وجود ندارد",
+                    message: "این واحد در محصولات استفاده شده است",
+                });
+            }
+            throw err;
         }
 
-        return res.json({
-            success: true,
-            message: "واحد با موفقیت حذف شد"
-        });
-
+        return res.json({ success: true, message: "واحد با موفقیت حذف شد" });
     } catch (e) {
-        console.error("❌ Server Error:", e);
-        return res.status(500).json({
-            success: false,
-            error: e.message
-        });
+        console.error("❌ DELETE Unit Error:", e);
+        return res.status(500).json({ success: false, error: e.message });
     }
 });
 

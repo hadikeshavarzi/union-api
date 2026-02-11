@@ -1,6 +1,6 @@
 // api/treasury/checks.js
 const express = require("express");
-const { supabaseAdmin } = require("../../supabaseAdmin");
+const { pool } = require("../../supabaseAdmin"); // اتصال به دیتابیس
 const authMiddleware = require("../middleware/auth");
 
 const router = express.Router();
@@ -8,28 +8,59 @@ const router = express.Router();
 /* GET ALL CHECKS */
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const { type, status } = req.query;
+        const {
+            status, // pending, passed, bounced, ...
+            type,   // payable, receivable
+            limit = 100,
+            search
+        } = req.query;
+
         const member_id = req.user.id;
 
-        let query = supabaseAdmin
-            .from("treasury_checks")
-            .select(`
-                *,
-                owner:accounting_tafsili!owner_id(id, title),
-                receiver:accounting_tafsili!receiver_id(id, title)
-            `)
-            .eq("member_id", member_id)
-            .order("created_at", { ascending: false });
+        // کوئری با اتصال به دسته‌چک و بانک
+        let queryText = `
+            SELECT 
+                c.*,
+                json_build_object(
+                    'id', cb.id,
+                    'sayad_id', cb.sayad_id,
+                    'bank_name', b.name
+                ) as checkbook
+            FROM public.treasury_checks c
+            LEFT JOIN public.treasury_checkbooks cb ON c.checkbook_id = cb.id
+            LEFT JOIN public.treasury_banks b ON cb.bank_id = b.id
+            WHERE c.member_id = $1
+        `;
 
-        if (type) query = query.eq("type", type);
-        if (status) query = query.eq("status", status);
+        const queryParams = [member_id];
+        let paramCounter = 2;
 
-        const { data, error } = await query;
+        if (status) {
+            queryText += ` AND c.status = $${paramCounter}`;
+            queryParams.push(status);
+            paramCounter++;
+        }
 
-        if (error) throw error;
+        if (type) {
+            queryText += ` AND c.type = $${paramCounter}`;
+            queryParams.push(type);
+            paramCounter++;
+        }
 
-        return res.json({ success: true, data: data || [] });
+        if (search) {
+            queryText += ` AND (c.check_number ILIKE $${paramCounter} OR c.sayad_number ILIKE $${paramCounter})`;
+            queryParams.push(`%${search}%`);
+            paramCounter++;
+        }
+
+        queryText += ` ORDER BY c.due_date ASC LIMIT $${paramCounter}`;
+        queryParams.push(Number(limit));
+
+        const result = await pool.query(queryText, queryParams);
+
+        return res.json({ success: true, data: result.rows });
     } catch (e) {
+        console.error("Error fetching checks:", e);
         return res.status(500).json({ success: false, error: e.message });
     }
 });
@@ -37,41 +68,137 @@ router.get("/", authMiddleware, async (req, res) => {
 /* GET ONE CHECK */
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        const { data, error } = await supabaseAdmin
-            .from("treasury_checks")
-            .select("*")
-            .eq("id", req.params.id)
-            .eq("member_id", req.user.id)
-            .single();
+        const id = req.params.id;
+        const member_id = req.user.id;
 
-        if (error || !data) {
+        const query = `
+            SELECT * FROM public.treasury_checks 
+            WHERE id = $1 AND member_id = $2
+        `;
+
+        const result = await pool.query(query, [id, member_id]);
+
+        if (result.rows.length === 0) {
             return res.status(404).json({ success: false, error: "چک یافت نشد" });
         }
 
-        return res.json({ success: true, data });
+        return res.json({ success: true, data: result.rows[0] });
     } catch (e) {
         return res.status(500).json({ success: false, error: e.message });
     }
 });
 
-/* Check Operations - Deposit */
-router.post("/deposit", authMiddleware, async (req, res) => {
-    res.json({ success: true, message: "قابلیت به زودی اضافه می‌شود" });
+/* CREATE CHECK (صدور چک) */
+router.post("/", authMiddleware, async (req, res) => {
+    try {
+        const member_id = req.user.id;
+        const body = req.body;
+
+        const payload = { ...body, member_id };
+        delete payload.id;
+        delete payload.created_at;
+
+        // چک تکراری بودن شماره چک در آن دسته‌چک
+        if (payload.checkbook_id && payload.check_number) {
+            const checkExist = await pool.query(
+                `SELECT id FROM public.treasury_checks WHERE checkbook_id = $1 AND check_number = $2`,
+                [payload.checkbook_id, payload.check_number]
+            );
+            if (checkExist.rows.length > 0) {
+                return res.status(409).json({ success: false, error: "این شماره چک قبلاً ثبت شده است" });
+            }
+        }
+
+        const keys = Object.keys(payload);
+        const values = Object.values(payload);
+        const placeholders = keys.map((_, i) => `$${i + 1}`).join(", ");
+        const columns = keys.join(", ");
+
+        const query = `
+            INSERT INTO public.treasury_checks (${columns}) 
+            VALUES (${placeholders}) 
+            RETURNING *
+        `;
+
+        const result = await pool.query(query, values);
+
+        return res.json({
+            success: true,
+            data: result.rows[0],
+            message: "چک با موفقیت ثبت شد"
+        });
+
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
 });
 
-/* Check Operations - Clear */
-router.post("/clear", authMiddleware, async (req, res) => {
-    res.json({ success: true, message: "قابلیت به زودی اضافه می‌شود" });
+/* UPDATE CHECK (ویرایش چک) */
+router.put("/:id", authMiddleware, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const member_id = req.user.id;
+        const payload = { ...req.body };
+
+        delete payload.id;
+        delete payload.member_id;
+        delete payload.created_at;
+
+        const keys = Object.keys(payload);
+        if (keys.length === 0) return res.status(400).json({ error: "No data" });
+
+        const setClause = keys.map((key, index) => `${key} = $${index + 1}`).join(", ");
+        const values = Object.values(payload);
+        values.push(id);
+        values.push(member_id);
+
+        const query = `
+            UPDATE public.treasury_checks 
+            SET ${setClause} 
+            WHERE id = $${values.length - 1} AND member_id = $${values.length} 
+            RETURNING *
+        `;
+
+        const result = await pool.query(query, values);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, error: "چک یافت نشد" });
+        }
+
+        return res.json({ success: true, data: result.rows[0], message: "ویرایش شد" });
+
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
 });
 
-/* Check Operations - Spend */
-router.post("/spend", authMiddleware, async (req, res) => {
-    res.json({ success: true, message: "قابلیت به زودی اضافه می‌شود" });
-});
+/* DELETE CHECK */
+router.delete("/:id", authMiddleware, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const member_id = req.user.id;
 
-/* Check Operations - Bounce */
-router.post("/bounce", authMiddleware, async (req, res) => {
-    res.json({ success: true, message: "قابلیت به زودی اضافه می‌شود" });
+        // فقط چک‌های پاس نشده (pending) قابل حذف هستند
+        const checkStatus = await pool.query(
+            `SELECT status FROM public.treasury_checks WHERE id = $1 AND member_id = $2`,
+            [id, member_id]
+        );
+
+        if (checkStatus.rows.length > 0 && checkStatus.rows[0].status !== 'pending') {
+            return res.status(400).json({
+                success: false,
+                error: "فقط چک‌های در جریان وصول قابل حذف هستند. برای بقیه باید وضعیت را تغییر دهید."
+            });
+        }
+
+        const query = `DELETE FROM public.treasury_checks WHERE id = $1 AND member_id = $2`;
+        await pool.query(query, [id, member_id]);
+
+        return res.json({ success: true, message: "چک حذف شد" });
+
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 module.exports = router;
