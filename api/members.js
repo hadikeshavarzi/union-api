@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const { randomUUID } = require("crypto");
 const { pool } = require("../supabaseAdmin");
 const auth = require("./middleware/auth");
 
@@ -176,6 +177,7 @@ const mapRowToPayload = (body = {}, ownerId = null) => {
     const companyLicenseImage = parseBigIntField(body.company_license_image);
 
     return {
+        id: normalizeUuid(body.id) || randomUUID(),
         role: nullable(body.role) || "union_member",
         full_name: nullable(body.full_name),
         father_name: nullable(body.father_name),
@@ -268,10 +270,10 @@ router.get("/list", auth, async (req, res) => {
         if (searchText) {
             values.push(`%${searchText}%`);
             clauses.push(`(
-                COALESCE(full_name, ) ILIKE $${values.length}
-                OR COALESCE(company_name, ) ILIKE $${values.length}
-                OR COALESCE(mobile, ) ILIKE $${values.length}
-                OR COALESCE(member_code, ) ILIKE $${values.length}
+                COALESCE(full_name, '') ILIKE $${values.length}
+                OR COALESCE(company_name, '') ILIKE $${values.length}
+                OR COALESCE(mobile, '') ILIKE $${values.length}
+                OR COALESCE(member_code, '') ILIKE $${values.length}
             )`);
         }
 
@@ -339,20 +341,21 @@ router.post("/system-users", auth, async (req, res) => {
 
         const r = await pool.query(
             `INSERT INTO public.members (
-                role, full_name, father_name, national_id, mobile, phone, email, address, birth_date,
+                id, role, full_name, father_name, national_id, mobile, phone, email, address, birth_date,
                 business_name, category, member_status, license_number, license_issue_date, license_expire_date,
                 company_name, registration_number, member_code, permissions, owner_id,
                 member_image, national_card_image, id_card_image, license_image, company_license_image,
                 created_at, updated_at
             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,
-                $10,$11,$12,$13,$14,$15,
-                $16,$17,$18,$19,$20,
-                $21,$22,$23,$24,$25,
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                $11,$12,$13,$14,$15,$16,
+                $17,$18,$19,$20,$21,
+                $22,$23,$24,$25,$26,
                 NOW(),NOW()
             )
             RETURNING ${MEMBER_SELECT_COLUMNS}`,
             [
+                payload.id,
                 payload.role,
                 payload.full_name,
                 payload.father_name,
@@ -403,20 +406,21 @@ router.post("/", auth, async (req, res) => {
 
         const r = await pool.query(
             `INSERT INTO public.members (
-                role, full_name, father_name, national_id, mobile, phone, email, address, birth_date,
+                id, role, full_name, father_name, national_id, mobile, phone, email, address, birth_date,
                 business_name, category, member_status, license_number, license_issue_date, license_expire_date,
                 company_name, registration_number, member_code, permissions, owner_id,
                 member_image, national_card_image, id_card_image, license_image, company_license_image,
                 created_at, updated_at
             ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,
-                $10,$11,$12,$13,$14,$15,
-                $16,$17,$18,$19,$20,
-                $21,$22,$23,$24,$25,
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                $11,$12,$13,$14,$15,$16,
+                $17,$18,$19,$20,$21,
+                $22,$23,$24,$25,$26,
                 NOW(),NOW()
             )
             RETURNING ${MEMBER_SELECT_COLUMNS}`,
             [
+                payload.id,
                 payload.role,
                 payload.full_name,
                 payload.father_name,
