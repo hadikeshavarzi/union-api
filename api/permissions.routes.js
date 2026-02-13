@@ -109,38 +109,56 @@ router.get('/my-forms', async (req, res) => {
     if (isSuperAdmin) {
       const result = await db.query(
         `
-          SELECT DISTINCT f.*
-          FROM ui_forms f
-          WHERE f.is_active = true
-            AND f.path IS NOT NULL
-            AND BTRIM(f.path) <> ''
-          ORDER BY f.menu_order ASC, f.created_at ASC NULLS LAST
+          SELECT *
+          FROM (
+            SELECT DISTINCT ON (LOWER(BTRIM(f.path))) f.*
+            FROM ui_forms f
+            WHERE f.is_active = true
+              AND f.path IS NOT NULL
+              AND BTRIM(f.path) <> ''
+            ORDER BY
+              LOWER(BTRIM(f.path)),
+              COALESCE(f.menu_order, 0) ASC,
+              f.updated_at DESC NULLS LAST,
+              f.created_at DESC NULLS LAST,
+              f.id DESC
+          ) dedup
+          ORDER BY COALESCE(menu_order, 0) ASC, created_at ASC NULLS LAST
         `
       );
       return res.json({ success: true, data: result.rows || [] });
     }
 
     const query = `
-      SELECT DISTINCT f.*
-      FROM ui_forms f
-      WHERE f.is_active = true
-        AND f.path IS NOT NULL
-        AND BTRIM(f.path) <> ''
-        AND (
-          COALESCE(BTRIM(f.permission_code), '') = ''
-          OR EXISTS (
-            SELECT 1
-            FROM permissions p
-            JOIN role_permissions rp ON rp.permission_id = p.id
-            JOIN user_roles ur ON ur.role_id = rp.role_id
-            JOIN roles r ON r.id = ur.role_id
-            WHERE LOWER(p.code) = LOWER(f.permission_code)
-              AND (ur.member_id = $1 OR ur.user_id = $1)
-              AND ur.is_active = true
-              AND COALESCE(r.is_active, true) = true
+      SELECT *
+      FROM (
+        SELECT DISTINCT ON (LOWER(BTRIM(f.path))) f.*
+        FROM ui_forms f
+        WHERE f.is_active = true
+          AND f.path IS NOT NULL
+          AND BTRIM(f.path) <> ''
+          AND (
+            COALESCE(BTRIM(f.permission_code), '') = ''
+            OR EXISTS (
+              SELECT 1
+              FROM permissions p
+              JOIN role_permissions rp ON rp.permission_id = p.id
+              JOIN user_roles ur ON ur.role_id = rp.role_id
+              JOIN roles r ON r.id = ur.role_id
+              WHERE LOWER(p.code) = LOWER(f.permission_code)
+                AND (ur.member_id = $1 OR ur.user_id = $1)
+                AND ur.is_active = true
+                AND COALESCE(r.is_active, true) = true
+            )
           )
-        )
-      ORDER BY f.menu_order ASC, f.created_at ASC NULLS LAST
+        ORDER BY
+          LOWER(BTRIM(f.path)),
+          COALESCE(f.menu_order, 0) ASC,
+          f.updated_at DESC NULLS LAST,
+          f.created_at DESC NULLS LAST,
+          f.id DESC
+      ) dedup
+      ORDER BY COALESCE(menu_order, 0) ASC, created_at ASC NULLS LAST
     `;
 
     const result = await db.query(query, [userId]);
