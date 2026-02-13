@@ -6,6 +6,49 @@ const authMiddleware = require("./middleware/auth");
 
 router.use(authMiddleware);
 
+const SUPER_ADMIN_ROLE_CODES = new Set([
+  "super_admin",
+  "super-admin",
+  "superadmin",
+  "owner",
+  "admin",
+  "root",
+  "system_admin",
+]);
+
+const normalizeRoleCode = (value) => String(value || "").toLowerCase().trim();
+
+const resolveRoleContext = async (userId) => {
+  const roleResult = await db.query(
+    `
+      SELECT ur.role_id, r.code
+      FROM user_roles ur
+      JOIN roles r ON ur.role_id = r.id
+      WHERE (ur.user_id = $1 OR ur.member_id = $1)
+        AND ur.is_active = true
+        AND COALESCE(r.is_active, true) = true
+    `,
+    [userId]
+  );
+
+  const memberResult = await db.query(
+    `SELECT role FROM members WHERE id = $1 LIMIT 1`,
+    [userId]
+  );
+
+  const roleIds = [...new Set(roleResult.rows.map((row) => row.role_id).filter(Boolean))];
+  const roleCodes = roleResult.rows
+    .map((row) => normalizeRoleCode(row.code))
+    .filter(Boolean);
+  const memberRole = normalizeRoleCode(memberResult.rows[0]?.role);
+
+  const isSuperAdmin =
+    roleCodes.some((code) => SUPER_ADMIN_ROLE_CODES.has(code)) ||
+    SUPER_ADMIN_ROLE_CODES.has(memberRole);
+
+  return { roleIds, roleCodes, memberRole, isSuperAdmin };
+};
+
 // ==================================================================
 // 1. دریافت پرمیشن‌های کاربر جاری (برای چک کردن دکمه‌ها و دسترسی کامپوننت‌ها)
 // ==================================================================
@@ -14,30 +57,27 @@ router.get('/my-permissions', async (req, res) => {
     const user = req.user;
     if (!user || !user.id) return res.status(401).json({ success: false, message: 'نشست نامعتبر' });
 
-    // دریافت نقش‌های کاربر
-    const roleQuery = `
-      SELECT role_id FROM user_roles 
-      WHERE (user_id = $1 OR member_id = $1) AND is_active = true
-    `;
-    const roleResult = await db.query(roleQuery, [user.id]);
-    const roleIds = roleResult.rows.map(r => r.role_id);
+    const { roleIds, isSuperAdmin } = await resolveRoleContext(user.id);
 
-    // اگر نقشی ندارد، پرمیشن خالی برگردان
-    if (roleIds.length === 0) return res.json({ success: true, permissions: {} });
-
-    // دریافت لیست پرمیشن‌های مرتبط با نقش‌ها
-    const permQuery = `
-      SELECT p.code FROM role_permissions rp
-      JOIN permissions p ON rp.permission_id = p.id
-      WHERE rp.role_id = ANY($1::uuid[]) 
-    `;
-    const permResult = await db.query(permQuery, [roleIds]);
-    
     // تبدیل آرایه به آبجکت برای جستجوی سریع در فرانت
     const permissionsMap = {};
-    permResult.rows.forEach(p => {
-      if (p.code) permissionsMap[p.code.toLowerCase().trim()] = true;
-    });
+
+    if (roleIds.length > 0) {
+      const permQuery = `
+        SELECT p.code
+        FROM role_permissions rp
+        JOIN permissions p ON rp.permission_id = p.id
+        WHERE rp.role_id = ANY($1::uuid[])
+      `;
+      const permResult = await db.query(permQuery, [roleIds]);
+      permResult.rows.forEach((p) => {
+        if (p.code) permissionsMap[p.code.toLowerCase().trim()] = true;
+      });
+    }
+
+    if (isSuperAdmin) {
+      permissionsMap["*"] = true;
+    }
 
     res.json({ success: true, permissions: permissionsMap });
   } catch (error) {
@@ -64,24 +104,43 @@ router.get('/ui-forms/all', async (req, res) => {
 router.get('/my-forms', async (req, res) => {
   try {
     const userId = req.user.id;
+    const { isSuperAdmin } = await resolveRoleContext(userId);
 
-    // ✅ کوئری هوشمند نهایی:
-    // ۱. اگر permission_code نال باشد = منوی عمومی (همه می‌بینند)
-    // ۲. اگر permission_code داشته باشد = باید نقش کاربر آن را داشته باشد
+    if (isSuperAdmin) {
+      const result = await db.query(
+        `
+          SELECT DISTINCT f.*
+          FROM ui_forms f
+          WHERE f.is_active = true
+            AND f.path IS NOT NULL
+            AND BTRIM(f.path) <> ''
+          ORDER BY f.menu_order ASC, f.created_at ASC NULLS LAST
+        `
+      );
+      return res.json({ success: true, data: result.rows || [] });
+    }
+
     const query = `
       SELECT DISTINCT f.*
       FROM ui_forms f
-      LEFT JOIN permissions p ON f.permission_code = p.code
-      LEFT JOIN role_permissions rp ON p.id = rp.permission_id
-      LEFT JOIN user_roles ur ON rp.role_id = ur.role_id
-      WHERE
-        f.is_active = true
+      WHERE f.is_active = true
+        AND f.path IS NOT NULL
+        AND BTRIM(f.path) <> ''
         AND (
-          (f.permission_code IS NULL OR f.permission_code = '') -- شرط ۱: منوی عمومی
-          OR 
-          (ur.member_id = $1 AND ur.is_active = true) -- شرط ۲: کاربر مجوز دارد
+          COALESCE(BTRIM(f.permission_code), '') = ''
+          OR EXISTS (
+            SELECT 1
+            FROM permissions p
+            JOIN role_permissions rp ON rp.permission_id = p.id
+            JOIN user_roles ur ON ur.role_id = rp.role_id
+            JOIN roles r ON r.id = ur.role_id
+            WHERE LOWER(p.code) = LOWER(f.permission_code)
+              AND (ur.member_id = $1 OR ur.user_id = $1)
+              AND ur.is_active = true
+              AND COALESCE(r.is_active, true) = true
+          )
         )
-      ORDER BY f.menu_order ASC
+      ORDER BY f.menu_order ASC, f.created_at ASC NULLS LAST
     `;
 
     const result = await db.query(query, [userId]);
