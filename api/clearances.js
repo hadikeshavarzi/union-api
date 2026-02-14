@@ -1,6 +1,6 @@
 // api/clearances.js
 const express = require("express");
-const { supabaseAdmin } = require("../supabaseAdmin");
+const { pool } = require("../supabaseAdmin");
 const authMiddleware = require("./middleware/auth");
 
 const router = express.Router();
@@ -8,450 +8,423 @@ const router = express.Router();
 /* ============================================================
    Helpers
 ============================================================ */
-function toNumber(v, fallback = 0) {
+function toNumber(v) {
     const n = Number(v);
-    return Number.isFinite(n) ? n : fallback;
+    return Number.isFinite(n) ? n : 0;
 }
 
-function uniq(arr) {
-    return [...new Set((arr || []).filter((x) => x !== null && x !== undefined))];
-}
-
-// ساخت OR برای eq:  col.eq.1,col.eq.2,...
-function orEqList(col, ids) {
-    const clean = uniq(ids).map((x) => toNumber(x)).filter((x) => Number.isFinite(x));
-    if (!clean.length) return null;
-    return clean.map((id) => `${col}.eq.${id}`).join(",");
-}
-
-/* ============================================================
-   Helper: تبدیل UUID به عدد (حل مشکل 22P02)
-============================================================ */
-async function getNumericMemberId(idInput) {
-    if (!idInput) return null;
-
-    // اگر از قبل عددی است
-    if (!isNaN(idInput) && !String(idInput).includes("-")) return Number(idInput);
-
-    // اگر UUID است: از members با auth_user_id پیدا کن
-    const { data, error } = await supabaseAdmin
-        .from("members")
-        .select("id")
-        .eq("auth_user_id", idInput)
-        .maybeSingle();
-
-    if (error) {
-        console.error("❌ Database Error in getNumericMemberId:", error.message);
+// Helper: دریافت ID ممبر
+async function getMemberId(userId) {
+    if (!userId) return null;
+    try {
+        const res = await pool.query("SELECT id FROM members WHERE auth_user_id = $1", [userId]);
+        if (res.rows.length === 0) {
+            const fallback = await pool.query("SELECT id FROM members LIMIT 1");
+            return fallback.rows.length > 0 ? fallback.rows[0].id : null;
+        }
+        return res.rows[0].id;
+    } catch (err) {
+        console.error("Error getting member id:", err);
         return null;
     }
-    return data ? Number(data.id) : null;
 }
 
-/* ============================================================
-   Helper: تولید شماره ترخیص اختصاصی
-============================================================ */
+// Helper: تولید شماره سند ترخیص
 async function generateClearanceNo(memberId) {
-    const { count, error } = await supabaseAdmin
-        .from("clearances")
-        .select("*", { count: "exact", head: true })
-        .eq("member_id", memberId);
-
-    if (error) throw new Error(error.message);
-
-    // فرمول: (آیدی انبار * 1000) + سری 200 + (تعداد + 1)
-    return memberId * 1000 + 200 + (toNumber(count) + 1);
+    try {
+        const res = await pool.query("SELECT count(*) as count FROM clearances WHERE member_id = $1", [memberId]);
+        const count = parseInt(res.rows[0].count);
+        return 10000 + (count + 1);
+    } catch (err) {
+        throw new Error("خطا در تولید شماره سند");
+    }
 }
 
 /* ============================================================
-   1) Owner Products Summary
-   - بدون join
-   - بدون in
+   1) Owner Products Summary - با محاسبه صحیح موجودی
+   فرمول: رسید - (خروجی + حواله) = موجودی
 ============================================================ */
 router.get("/owner-products/:ownerId", authMiddleware, async (req, res) => {
     try {
-        const owner_id = toNumber(req.params.ownerId);
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2; // fallback
+        const owner_id = req.params.ownerId; 
 
-        // 1) receipts متعلق به owner/member
-        const { data: receipts, error: recErr } = await supabaseAdmin
-            .from("receipts")
-            .select("id")
-            .eq("owner_id", owner_id)
-            .eq("member_id", member_id);
+        const query = `
+            SELECT 
+                t.product_id,
+                p.name as product_title,
+                -- ورودی
+                SUM(CASE WHEN t.type = 'in' THEN t.qty ELSE 0 END) as total_in_qty,
+                SUM(CASE WHEN t.type = 'in' THEN t.weight ELSE 0 END) as total_in_weight,
+                -- خروجی (شامل clearance, exit, loading)
+                SUM(
+                    CASE 
+                        WHEN t.type = 'out' 
+                            OR t.transaction_type IN ('clearance', 'exit', 'loading') 
+                        THEN ABS(t.qty) 
+                        ELSE 0 
+                    END
+                ) as total_out_qty,
+                SUM(
+                    CASE 
+                        WHEN t.type = 'out' 
+                            OR t.transaction_type IN ('clearance', 'exit', 'loading') 
+                        THEN ABS(t.weight) 
+                        ELSE 0 
+                    END
+                ) as total_out_weight
+            FROM inventory_transactions t
+            LEFT JOIN products p ON p.id = t.product_id
+            WHERE t.owner_id = $1
+            GROUP BY t.product_id, p.name
+            HAVING 
+                (SUM(CASE WHEN t.type = 'in' THEN t.qty ELSE 0 END) - 
+                 SUM(CASE WHEN t.type = 'out' OR t.transaction_type IN ('clearance', 'exit', 'loading') THEN ABS(t.qty) ELSE 0 END)) > 0
+        `;
 
-        if (recErr) throw new Error(recErr.message);
+        const { rows } = await pool.query(query, [owner_id]);
 
-        const receiptIds = uniq((receipts || []).map((r) => r.id));
-        if (!receiptIds.length) {
-            return res.json({ success: true, data: [] });
-        }
+        const summary = rows.map(row => ({
+            product_id: row.product_id,
+            product_title: row.product_title || "نامشخص",
+            // موجودی واقعی = ورودی - خروجی
+            total_qty_available: toNumber(row.total_in_qty) - toNumber(row.total_out_qty),
+            total_weight_available: toNumber(row.total_in_weight) - toNumber(row.total_out_weight)
+        }));
 
-        // 2) receipt_items برای آن receipts (با OR)
-        const orReceipt = orEqList("receipt_id", receiptIds);
-        let itemsQuery = supabaseAdmin
-            .from("receipt_items")
-            .select("receipt_id, product_id, count, weights_net, row_code");
+        res.json({ success: true, data: summary });
 
-        if (orReceipt) itemsQuery = itemsQuery.or(orReceipt);
-
-        const { data: receiptItems, error: itErr } = await itemsQuery;
-        if (itErr) throw new Error(itErr.message);
-
-        // 3) inventory_transactions برای owner/member
-        const { data: txs, error: txErr } = await supabaseAdmin
-            .from("inventory_transactions")
-            .select("product_id, qty, weight")
-            .eq("owner_id", owner_id)
-            .eq("member_id", member_id);
-
-        if (txErr) throw new Error(txErr.message);
-
-        // 4) fetch product names (با OR روی products.id)
-        const productIds = uniq((receiptItems || []).map((x) => x.product_id));
-        let productNames = {};
-
-        if (productIds.length) {
-            const orProd = orEqList("id", productIds);
-            let pQuery = supabaseAdmin.from("products").select("id, name");
-            if (orProd) pQuery = pQuery.or(orProd);
-
-            const { data: prods, error: pErr } = await pQuery;
-            if (pErr) throw new Error(pErr.message);
-
-            (prods || []).forEach((p) => (productNames[p.id] = p.name));
-        }
-
-        // 5) aggregation
-        const map = {};
-
-        // ورودی از receipt_items
-        (receiptItems || []).forEach((it) => {
-            const pid = it.product_id;
-            if (!map[pid]) {
-                map[pid] = {
-                    product_id: pid,
-                    product_title: productNames[pid] || "کالای نامشخص",
-                    total_qty_available: 0,
-                    total_weight_available: 0,
-                };
-            }
-            map[pid].total_qty_available += toNumber(it.count);
-            map[pid].total_weight_available += toNumber(it.weights_net);
-        });
-
-        // جمع جبری با تراکنش‌ها
-        (txs || []).forEach((tx) => {
-            const pid = tx.product_id;
-            if (!map[pid]) return; // فقط چیزهایی که از receipt فهمیدیم (مثل نسخه خودت)
-            map[pid].total_qty_available += toNumber(tx.qty);
-            map[pid].total_weight_available += toNumber(tx.weight);
-        });
-
-        const summary = Object.values(map).filter((x) => x.total_qty_available > 0);
-
-        return res.json({ success: true, data: summary });
     } catch (e) {
-        console.error("❌ Owner Products Error:", e.message);
-        return res.status(500).json({ success: false, error: e.message });
+        console.error("❌ Owner Products Error:", e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
 /* ============================================================
-   2) Batches
-   - بدون join
-   - بدون in
+   2) Batches - با محاسبه صحیح موجودی
+   فرمول: رسید - (خروجی + حواله) = موجودی
 ============================================================ */
 router.get("/batches", authMiddleware, async (req, res) => {
     try {
-        const owner_id = toNumber(req.query.owner_id);
-        const product_id = toNumber(req.query.product_id);
-
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
+        const owner_id = req.query.owner_id;
+        const product_id = req.query.product_id;
 
         if (!owner_id || !product_id) {
-            return res.status(400).json({ success: false, error: "Missing params: owner_id, product_id" });
+            return res.status(400).json({ success: false, error: "Missing params" });
         }
 
-        // 1) receipts ids
-        const { data: receipts, error: recErr } = await supabaseAdmin
-            .from("receipts")
-            .select("id")
-            .eq("owner_id", owner_id)
-            .eq("member_id", member_id);
+        const query = `
+            WITH RawData AS (
+                SELECT 
+                    t.id, t.qty, t.weight, t.created_at,
+                    t.batch_no, t.parent_batch_no, t.ref_receipt_id,
+                    t.type, t.transaction_type,
+                    ri.row_code as receipt_row_code,
+                    -- ساختن کلید گروه‌بندی
+                    CASE 
+                        WHEN t.batch_no IS NOT NULL AND t.batch_no != '' THEN t.batch_no
+                        WHEN ri.row_code IS NOT NULL AND ri.row_code != '' THEN ri.row_code
+                        ELSE 'NO_BATCH_GROUP'
+                    END as grouping_key,
+                    -- نام نمایشی
+                    CASE 
+                        WHEN t.batch_no IS NOT NULL AND t.batch_no != '' THEN t.batch_no
+                        WHEN ri.row_code IS NOT NULL AND ri.row_code != '' THEN ri.row_code
+                        ELSE 'بدون ردیف'
+                    END as display_name
+                FROM inventory_transactions t
+                LEFT JOIN receipt_items ri ON (
+                    (t.ref_receipt_id IS NOT NULL AND t.ref_receipt_id = ri.receipt_id AND t.product_id = ri.product_id)
+                    OR
+                    (t.reference_id IS NOT NULL AND t.reference_id::text = ri.id::text)
+                )
+                WHERE t.owner_id = $1 AND t.product_id = $2
+            ),
+            -- محاسبه موجودی: رسید - (خروجی + حواله)
+            StockCalculation AS (
+                SELECT 
+                    grouping_key,
+                    MAX(display_name) as batch_no,
+                    -- ورودی (فقط type='in')
+                    SUM(CASE WHEN type = 'in' THEN qty ELSE 0 END) as total_in_qty,
+                    SUM(CASE WHEN type = 'in' THEN weight ELSE 0 END) as total_in_weight,
+                    -- خروجی (type='out' یا transaction_type IN ('clearance', 'exit', 'loading'))
+                    SUM(
+                        CASE 
+                            WHEN type = 'out' 
+                                OR transaction_type IN ('clearance', 'exit', 'loading') 
+                            THEN ABS(qty) 
+                            ELSE 0 
+                        END
+                    ) as total_out_qty,
+                    SUM(
+                        CASE 
+                            WHEN type = 'out' 
+                                OR transaction_type IN ('clearance', 'exit', 'loading') 
+                            THEN ABS(weight) 
+                            ELSE 0 
+                        END
+                    ) as total_out_weight,
+                    MIN(created_at) as first_transaction_date,
+                    json_agg(
+                        json_build_object(
+                            'id', id,
+                            'qty', qty,
+                            'weight', weight,
+                            'transaction_date', created_at,
+                            'batch_no', display_name,
+                            'parent_batch_no', parent_batch_no,
+                            'type', type,
+                            'transaction_type', transaction_type
+                        ) ORDER BY created_at
+                    ) as history
+                FROM RawData
+                GROUP BY grouping_key
+            )
+            SELECT 
+                batch_no,
+                -- موجودی نهایی = ورودی - خروجی
+                (total_in_qty - total_out_qty) as qty_available,
+                (total_in_weight - total_out_weight) as weight_available,
+                first_transaction_date as transaction_date,
+                history
+            FROM StockCalculation
+            WHERE (total_in_qty - total_out_qty) > 0 
+               OR (total_in_weight - total_out_weight) > 0
+            ORDER BY first_transaction_date ASC
+        `;
 
-        if (recErr) throw new Error(recErr.message);
+        const { rows } = await pool.query(query, [owner_id, product_id]);
 
-        const receiptIds = uniq((receipts || []).map((r) => r.id));
-        if (!receiptIds.length) return res.json({ success: true, data: [] });
+        const result = rows.map(row => ({
+            batch_no: row.batch_no,
+            qty_available: toNumber(row.qty_available),
+            weight_available: toNumber(row.weight_available),
+            transaction_date: row.transaction_date,
+            history: row.history
+        }));
 
-        // 2) receipt_items for those receipts + product_id
-        const orReceipt = orEqList("receipt_id", receiptIds);
-        let riQuery = supabaseAdmin
-            .from("receipt_items")
-            .select("id, receipt_id, product_id, row_code, count, weights_net")
-            .eq("product_id", product_id);
+        res.json({ success: true, data: result });
 
-        if (orReceipt) riQuery = riQuery.or(orReceipt);
-
-        const { data: receiptItems, error: riErr } = await riQuery;
-        if (riErr) throw new Error(riErr.message);
-
-        // 3) all inventory tx for that owner/product/member
-        const { data: allTx, error: txErr } = await supabaseAdmin
-            .from("inventory_transactions")
-            .select("id, product_id, qty, weight, batch_no, parent_batch_no, ref_type, ref_id, created_at")
-            .eq("owner_id", owner_id)
-            .eq("member_id", member_id)
-            .eq("product_id", product_id);
-
-        if (txErr) throw new Error(txErr.message);
-
-        const result = [];
-
-        (receiptItems || []).forEach((receipt) => {
-            const batchName = receipt.row_code || `ID-${receipt.id}`;
-
-            let currentQty = toNumber(receipt.count);
-            let currentWeight = toNumber(receipt.weights_net);
-
-            const relatedTx = (allTx || []).filter((tx) => {
-                if (!tx.batch_no) return false;
-                return tx.batch_no === batchName || String(tx.batch_no).startsWith(batchName + "/");
-            });
-
-            relatedTx.forEach((tx) => {
-                currentQty += toNumber(tx.qty);
-                currentWeight += toNumber(tx.weight);
-            });
-
-            if (currentQty > 0) {
-                const history = relatedTx.map((tx) => ({
-                    ...tx,
-                    display_qty: Math.abs(toNumber(tx.qty)),
-                    display_weight: Math.abs(toNumber(tx.weight)),
-                    qty: toNumber(tx.qty),
-                    weight: toNumber(tx.weight),
-                    parent_batch_no: batchName,
-                }));
-
-                result.push({
-                    batch_no: batchName,
-                    qty_available: currentQty,
-                    weight_available: currentWeight,
-                    history,
-                });
-            }
-        });
-
-        return res.json({ success: true, data: result });
     } catch (e) {
-        console.error("❌ Batch Error:", e.message);
-        return res.status(500).json({ success: false, error: e.message });
+        console.error("❌ Batch Error:", e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
 /* ============================================================
    3) CREATE Clearance
-   - بدون rpc
-   - به جای rpc: ثبت inventory_transactions (کسر موجودی)
 ============================================================ */
 router.post("/", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
     try {
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
+        await client.query('BEGIN');
+
+        let member_id = await getMemberId(req.user.id);
+        if (!member_id) {
+            const fb = await client.query("SELECT id FROM members LIMIT 1");
+            member_id = fb.rows[0]?.id;
+        }
 
         const {
-            customer_id,
-            clearance_date,
-            receiver_person_name,
-            receiver_person_national_id,
-            driver_name,
-            plate,
-            description,
-            items,
-            doc_type_id = 1,
+            customer_id, clearance_date, 
+            receiver_person_name, receiver_person_national_id,
+            driver_name, plate, description, items, 
+            doc_type_id = '72b5831e-f37b-8c8b-c189-2e3538aff23a'
         } = req.body;
 
-        if (!customer_id) {
-            return res.status(400).json({ success: false, error: "customer_id الزامی است" });
-        }
-        if (!Array.isArray(items) || !items.length) {
-            return res.status(400).json({ success: false, error: "items الزامی است" });
+        if (!customer_id || !items || items.length === 0) {
+            throw new Error("اطلاعات ناقص است");
         }
 
         const clearanceNo = await generateClearanceNo(member_id);
 
-        // A) Header
-        const { data: clearance, error: hErr } = await supabaseAdmin
-            .from("clearances")
-            .insert({
-                doc_type_id,
-                clearance_no: clearanceNo,
-                member_id,
-                status: "final",
-                clearance_date: clearance_date || new Date().toISOString(),
-                customer_id,
-                receiver_person_name: receiver_person_name || null,
-                receiver_person_national_id: receiver_person_national_id || null,
-                driver_name: driver_name || null,
-                vehicle_plate_iran_right: plate?.right2 || null,
-                vehicle_plate_mid3: plate?.middle3 || null,
-                vehicle_plate_letter: plate?.letter || null,
-                vehicle_plate_left2: plate?.left2 || null,
-                description: description || null,
-            })
-            .select()
-            .single();
-
-        if (hErr) {
-            console.error("❌ Clearance Header Error:", hErr.message);
-            return res.status(500).json({ success: false, error: hErr.message });
+        let pRight='', pMid='', pLet='', pLeft='';
+        const plateStr = (plate && typeof plate === 'object') ? plate.plate_number : plate;
+        if (plateStr && typeof plateStr === 'string') {
+            const parts = plateStr.split('-');
+            pLeft = parts[0]||''; pMid = parts[1]||''; pLet = parts[2]||''; pRight = parts[3]||'';
+        } else if (plate && typeof plate === 'object') {
+             pRight = plate.right2; pMid = plate.middle3; pLet = plate.letter; pLeft = plate.left2;
         }
 
-        // B) Items
-        const formattedItems = items.map((item) => ({
-            clearance_id: clearance.id,
-            product_id: toNumber(item.product_id),
-            owner_id: toNumber(customer_id),
-            qty: toNumber(item.qty),
-            weight: toNumber(item.weight),
-            parent_batch_no: item.parent_batch_no || null,
-            batch_no: item.batch_no || null,
-            status: "issued",
-        }));
+        // 1. ثبت هدر
+        const insertHeaderSql = `
+            INSERT INTO clearances (
+                doc_type_id, clearance_no, member_id, status, clearance_date, customer_id,
+                receiver_person_name, receiver_person_national_id, driver_name,
+                vehicle_plate_iran_right, vehicle_plate_mid3, vehicle_plate_letter, vehicle_plate_left2, description
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            RETURNING id
+        `;
+        const headerValues = [
+            doc_type_id, clearanceNo, member_id, 'final', clearance_date || new Date(), customer_id,
+            receiver_person_name, receiver_person_national_id, driver_name,
+            pRight, pMid, pLet, pLeft, description
+        ];
+        
+        const headerRes = await client.query(insertHeaderSql, headerValues);
+        const clearanceId = headerRes.rows[0].id;
 
-        const { error: iErr } = await supabaseAdmin.from("clearance_items").insert(formattedItems);
-        if (iErr) {
-            await supabaseAdmin.from("clearances").delete().eq("id", clearance.id);
-            console.error("❌ Clearance Items Error:", iErr.message);
-            return res.status(500).json({ success: false, error: iErr.message });
+        // 2. ثبت اقلام
+        for (const item of items) {
+            const qty = toNumber(item.qty);
+            const weight = toNumber(item.weight);
+            const prodId = item.product_id;
+
+            // ثبت در clearance_items
+            await client.query(`
+                INSERT INTO clearance_items (
+                    clearance_id, product_id, owner_id, qty, weight,
+                    parent_batch_no, new_batch_no, manual_ref_id, attachment_url, description, status
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            `, [
+                clearanceId, prodId, customer_id, qty, weight,
+                item.parent_batch_no, item.new_batch_no, 
+                item.manual_ref_id, item.attachment_url, item.description, 'issued'
+            ]);
         }
 
-        // C) Inventory Sync (جایگزین rpc)
-        // هر آیتم ترخیص => یک تراکنش منفی در inventory_transactions
-        const nowIso = new Date().toISOString();
-        const txRows = formattedItems.map((it) => ({
-            member_id,
-            owner_id: toNumber(customer_id),
-            product_id: toNumber(it.product_id),
-            qty: -Math.abs(toNumber(it.qty)),
-            weight: -Math.abs(toNumber(it.weight)),
-            batch_no: it.batch_no || it.parent_batch_no || null,
-            parent_batch_no: it.parent_batch_no || null,
-            ref_type: "clearance",
-            ref_id: clearance.id,
-            created_at: nowIso,
-        }));
+        // ✅ Trigger خودکار inventory_transactions را ثبت می‌کند
 
-        const { error: txErr } = await supabaseAdmin.from("inventory_transactions").insert(txRows);
-        if (txErr) {
-            // اگر اینجا خطا خورد، ما rollback کامل نمی‌کنیم چون ترخیص ثبت شده
-            // ولی حداقل گزارش دقیق می‌دهیم
-            console.error("❌ Inventory Sync Error:", txErr.message);
-            return res.status(500).json({
-                success: false,
-                error: "ترخیص ثبت شد اما کسر موجودی ناموفق بود",
-                details: txErr.message,
-                id: clearance.id,
-                clearance_no: clearanceNo,
-            });
-        }
+        await client.query('COMMIT');
+        res.json({ success: true, clearance_no: clearanceNo, id: clearanceId, message: "ثبت شد" });
 
-        return res.json({
-            success: true,
-            clearance_no: clearanceNo,
-            id: clearance.id,
-            message: "سند ترخیص با موفقیت ثبت و موجودی کسر شد.",
-        });
     } catch (e) {
-        console.error("❌ Server Error:", e.message);
-        return res.status(500).json({ success: false, error: e.message });
+        await client.query('ROLLBACK');
+        console.error("❌ Create Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 
 /* ============================================================
-   4) REPORT
-   - بدون join/embed
+   4) REPORT - با محاسبه صحیح موجودی
 ============================================================ */
 router.get("/report", authMiddleware, async (req, res) => {
     try {
-        let member_id = await getNumericMemberId(req.user.id);
-        if (!member_id) member_id = 2;
+        const query = `
+            SELECT 
+                c.*, 
+                cust.name as customer_name,
+                cust.full_name as customer_full_name
+            FROM clearances c
+            LEFT JOIN customers cust ON cust.id = c.customer_id
+            ORDER BY c.clearance_date DESC
+            LIMIT 500
+        `;
+        
+        const { rows: clearances } = await pool.query(query);
 
-        // 1) clearances
-        const { data: clearances, error: cErr } = await supabaseAdmin
-            .from("clearances")
-            .select("*")
-            .eq("member_id", member_id)
-            .order("clearance_date", { ascending: false });
+        if (clearances.length === 0) return res.json({ success: true, data: [] });
 
-        if (cErr) throw new Error(cErr.message);
+        const ids = clearances.map(c => c.id);
+        
+        // ✅ اضافه کردن محاسبه موجودی برای هر clearance item
+        const itemsQuery = `
+            SELECT 
+                ci.*,
+                p.name as product_name,
+                c.clearance_date,
+                -- محاسبه موجودی فعلی batch
+                (
+                    SELECT COALESCE(
+                        SUM(CASE WHEN it.type = 'in' THEN it.qty ELSE 0 END) - 
+                        SUM(CASE 
+                            WHEN it.type = 'out' OR it.transaction_type IN ('clearance', 'exit', 'loading') 
+                            THEN ABS(it.qty) 
+                            ELSE 0 
+                        END), 
+                        0
+                    )
+                    FROM inventory_transactions it
+                    WHERE it.owner_id = ci.owner_id 
+                      AND it.product_id = ci.product_id
+                      AND COALESCE(it.batch_no, '') = COALESCE(ci.parent_batch_no, '')
+                ) as current_stock
+            FROM clearance_items ci
+            LEFT JOIN products p ON p.id = ci.product_id
+            LEFT JOIN clearances c ON c.id = ci.clearance_id
+            WHERE ci.clearance_id = ANY($1::uuid[])
+        `;
+        
+        const { rows: items } = await pool.query(itemsQuery, [ids]);
 
-        const clearanceIds = uniq((clearances || []).map((c) => c.id));
-        const customerIds = uniq((clearances || []).map((c) => c.customer_id));
-
-        // 2) customers map
-        let customersMap = {};
-        if (customerIds.length) {
-            const orCust = orEqList("id", customerIds);
-            let custQ = supabaseAdmin.from("customers").select("id, name");
-            if (orCust) custQ = custQ.or(orCust);
-
-            const { data: customers, error: cuErr } = await custQ;
-            if (cuErr) throw new Error(cuErr.message);
-
-            (customers || []).forEach((c) => (customersMap[c.id] = c));
-        }
-
-        // 3) clearance_items
-        let items = [];
-        if (clearanceIds.length) {
-            const orClr = orEqList("clearance_id", clearanceIds);
-            let itQ = supabaseAdmin.from("clearance_items").select("*");
-            if (orClr) itQ = itQ.or(orClr);
-
-            const { data: its, error: iErr } = await itQ;
-            if (iErr) throw new Error(iErr.message);
-
-            items = its || [];
-        }
-
-        // 4) products map
-        const productIds = uniq(items.map((i) => i.product_id));
-        let productsMap = {};
-        if (productIds.length) {
-            const orProd = orEqList("id", productIds);
-            let pQ = supabaseAdmin.from("products").select("id, name");
-            if (orProd) pQ = pQ.or(orProd);
-
-            const { data: prods, error: pErr } = await pQ;
-            if (pErr) throw new Error(pErr.message);
-
-            (prods || []).forEach((p) => (productsMap[p.id] = p));
-        }
-
-        // 5) assemble
         const itemsByClearance = {};
-        items.forEach((it) => {
-            const cid = it.clearance_id;
-            if (!itemsByClearance[cid]) itemsByClearance[cid] = [];
-            itemsByClearance[cid].push({
+        items.forEach(it => {
+            if (!itemsByClearance[it.clearance_id]) itemsByClearance[it.clearance_id] = [];
+            itemsByClearance[it.clearance_id].push({
                 ...it,
-                product: productsMap[it.product_id] || null,
+                product: { id: it.product_id, title: it.product_name },
+                available_stock: toNumber(it.current_stock) // ✅ موجودی واقعی
             });
         });
 
-        const out = (clearances || []).map((c) => ({
+        const output = clearances.map(c => ({
             ...c,
-            customer: customersMap[c.customer_id] || null,
-            clearance_items: itemsByClearance[c.id] || [],
+            customer: { 
+                id: c.customer_id, 
+                label: c.customer_name || c.customer_full_name 
+            },
+            clearance_items: itemsByClearance[c.id] || []
         }));
 
-        return res.json({ success: true, data: out });
+        res.json({ success: true, data: output });
+
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message });
+        console.error(e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/* ============================================================
+   5) GET ITEMS OF A CLEARANCE - با موجودی صحیح
+============================================================ */
+router.get("/:clearanceId/items", authMiddleware, async (req, res) => {
+    try {
+        const { clearanceId } = req.params;
+
+        const query = `
+            SELECT 
+                ci.*,
+                p.name as product_name,
+                c.clearance_date,
+                -- موجودی واقعی batch در زمان فعلی
+                (
+                    SELECT COALESCE(
+                        SUM(CASE WHEN it.type = 'in' THEN it.qty ELSE 0 END) - 
+                        SUM(CASE 
+                            WHEN it.type = 'out' OR it.transaction_type IN ('clearance', 'exit', 'loading') 
+                            THEN ABS(it.qty) 
+                            ELSE 0 
+                        END), 
+                        0
+                    )
+                    FROM inventory_transactions it
+                    WHERE it.owner_id = ci.owner_id 
+                      AND it.product_id = ci.product_id
+                      AND COALESCE(it.batch_no, '') = COALESCE(ci.parent_batch_no, '')
+                ) as current_stock
+            FROM clearance_items ci
+            LEFT JOIN products p ON p.id = ci.product_id
+            LEFT JOIN clearances c ON c.id = ci.clearance_id
+            WHERE ci.clearance_id = $1
+            ORDER BY ci.created_at
+        `;
+
+        const { rows } = await pool.query(query, [clearanceId]);
+
+        const items = rows.map(row => ({
+            ...row,
+            product: { id: row.product_id, title: row.product_name },
+            available_stock: toNumber(row.current_stock)
+        }));
+
+        res.json({ success: true, data: items });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 

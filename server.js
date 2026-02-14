@@ -91,6 +91,8 @@ app.use((req, res, next) => {
 
 // --- بخش احراز هویت ---
 mountRoute("/api/auth", authRoutes);
+mountRoute("/api/auth/customer-request-otp", "./api/auth/customer-request-otp");
+mountRoute("/api/auth/customer-verify-otp", "./api/auth/customer-verify-otp");
 
 // --- بخش انبارداری و کالا ---
 mountRoute('/api/warehouse', './api/warehouse'); // ✅ اضافه شد برای رفع ارور داشبورد
