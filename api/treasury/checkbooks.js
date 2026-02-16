@@ -6,7 +6,7 @@ const authMiddleware = require("../middleware/auth");
 // 1. لیست دسته‌چک‌ها (GET)
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { bank_id } = req.query;
 
         let sql = `
@@ -36,7 +36,7 @@ router.get("/", authMiddleware, async (req, res) => {
 // 2. ایجاد دسته‌چک جدید (POST)
 router.post("/", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { bank_id, serial_start, serial_end, description } = req.body;
 
         if (!bank_id || !serial_start || !serial_end) {
@@ -57,11 +57,38 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 });
 
-// 3. حذف دسته‌چک (DELETE)
+// 3. ویرایش دسته‌چک (PUT)
+router.put("/:id", authMiddleware, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const member_id = req.user.member_id;
+        const { bank_id, serial_start, serial_end, description, status } = req.body;
+
+        const updateSql = `
+            UPDATE public.treasury_checkbooks SET
+                bank_id = COALESCE($1, bank_id),
+                serial_start = COALESCE($2, serial_start),
+                serial_end = COALESCE($3, serial_end),
+                description = COALESCE($4, description),
+                status = COALESCE($5, status)
+            WHERE id = $6 AND member_id = $7
+            RETURNING *
+        `;
+
+        const { rows } = await pool.query(updateSql, [bank_id, serial_start, serial_end, description, status, id, member_id]);
+        if (rows.length === 0) return res.status(404).json({ success: false, error: "دسته‌چک یافت نشد" });
+
+        res.json({ success: true, data: rows[0], message: "دسته‌چک ویرایش شد" });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// 4. حذف دسته‌چک (DELETE)
 router.delete("/:id", authMiddleware, async (req, res) => {
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         const { rowCount } = await pool.query(
             "DELETE FROM public.treasury_checkbooks WHERE id = $1 AND member_id = $2",

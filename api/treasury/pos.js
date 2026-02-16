@@ -22,7 +22,7 @@ async function generateNextTafsiliCode(client, memberId, type) {
 // 1. لیست کارتخوان‌ها (GET)
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { with_bank, with_tafsili } = req.query;
 
         let sql = `
@@ -47,8 +47,8 @@ router.get("/", authMiddleware, async (req, res) => {
 // 2. دریافت یک کارتخوان
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         const sql = `
             SELECT tp.*,
@@ -74,7 +74,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { title, bank_id, terminal_id, description, is_active } = req.body;
 
         if (!title || !bank_id) return res.status(400).json({ success: false, error: "عنوان و حساب متصل الزامی است" });
@@ -121,12 +121,48 @@ router.post("/", authMiddleware, async (req, res) => {
     }
 });
 
-// 4. ویرایش و حذف (مشابه بالا)
+// 4. ویرایش کارتخوان (PUT)
+router.put("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id = req.params.id;
+        const member_id = req.user.member_id;
+        const { title, bank_id, terminal_id, description, is_active } = req.body;
+
+        const checkRes = await client.query("SELECT id, tafsili_id FROM public.treasury_pos WHERE id=$1 AND member_id=$2", [id, member_id]);
+        if (checkRes.rowCount === 0) return res.status(404).json({ success: false, error: "کارتخوان یافت نشد" });
+        const existing = checkRes.rows[0];
+
+        await client.query("BEGIN");
+
+        const updateSql = `
+            UPDATE public.treasury_pos SET
+                title=$1, bank_id=$2, terminal_id=$3, description=$4, is_active=$5
+            WHERE id=$6 AND member_id=$7
+            RETURNING *
+        `;
+        const updateRes = await client.query(updateSql, [title, bank_id, terminal_id, description, is_active !== false, id, member_id]);
+
+        if (title && existing.tafsili_id) {
+            await client.query("UPDATE public.accounting_tafsili SET title=$1 WHERE id=$2", [title, existing.tafsili_id]);
+        }
+
+        await client.query("COMMIT");
+        res.json({ success: true, data: updateRes.rows[0], message: "کارتخوان ویرایش شد" });
+    } catch (e) {
+        await client.query("ROLLBACK");
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// 5. حذف کارتخوان (DELETE)
 router.delete("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         const checkRes = await client.query("SELECT id, tafsili_id FROM public.treasury_pos WHERE id=$1 AND member_id=$2", [id, member_id]);
         if (checkRes.rowCount === 0) return res.status(404).json({ success: false, error: "یافت نشد" });

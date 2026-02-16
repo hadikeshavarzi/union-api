@@ -57,7 +57,7 @@ const sanitize = (body, fields) =>
 router.get("/", authMiddleware, async (req, res) => {
   try {
     const { receipt_id, owner_id, product_id, limit = 500, offset = 0 } = req.query;
-    const member_id = req.user.id;
+    const member_id = req.user.member_id;
 
     // اگر receipt_id داده شده، اول چک کنیم member دسترسی داره
     if (receipt_id) {
@@ -152,7 +152,7 @@ router.get("/", authMiddleware, async (req, res) => {
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
     const item_id = Number(req.params.id);
-    const member_id = req.user.id;
+    const member_id = req.user.member_id;
 
     const { data, error } = await supabaseAdmin
         .from("receipt_items")
@@ -223,7 +223,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
   try {
     const clean = sanitize(req.body, CREATE_FIELDS);
-    const member_id = req.user.id;
+    const member_id = req.user.member_id;
 
     // اعتبارسنجی
     if (!clean.receipt_id || !clean.product_id) {
@@ -316,7 +316,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const clean = sanitize(req.body, UPDATE_FIELDS);
-    const member_id = req.user.id;
+    const member_id = req.user.member_id;
 
     if (!Object.keys(clean).length) {
       return res.status(400).json({
@@ -383,7 +383,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.delete("/:id", authMiddleware, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const member_id = req.user.id;
+    const member_id = req.user.member_id;
 
     // ✅ گرفتن item با چک member_id
     const { data: item, error: itemError } = await supabaseAdmin
@@ -440,7 +440,7 @@ router.delete("/:id", authMiddleware, async (req, res) => {
 router.post("/bulk-delete", authMiddleware, async (req, res) => {
   try {
     const { ids } = req.body;
-    const member_id = req.user.id;
+    const member_id = req.user.member_id;
 
     if (!ids || !Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({

@@ -199,7 +199,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const b = req.body || {};
 
         if (!b.owner_id || !isUUID(b.owner_id)) {
@@ -330,7 +330,7 @@ router.post("/", authMiddleware, async (req, res) => {
 router.put("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const receiptId = req.params.id;
         const b = req.body || {};
 

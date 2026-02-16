@@ -14,7 +14,7 @@ const toNum = (v) => (v ? Number(String(v).replace(/,/g, "")) : 0);
 router.post("/register-receipt-doc", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { 
             paymentAmount, date, customerId, sourceId, 
             receiptId, receiptNo, description 

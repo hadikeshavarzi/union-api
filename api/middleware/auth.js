@@ -100,4 +100,20 @@ async function authMiddleware(req, res, next) {
   }
 }
 
+const SUPER_ADMIN_ROLES = new Set([
+    "super_admin", "superadmin", "admin", "owner", "root", "system_admin"
+]);
+
+function requireSuperAdmin(req, res, next) {
+    const role = (req.user?.role || "").toLowerCase();
+    if (SUPER_ADMIN_ROLES.has(role)) {
+        return next();
+    }
+    return res.status(403).json({
+        success: false,
+        error: "دسترسی فقط برای سوپرادمین مجاز است"
+    });
+}
+
 module.exports = authMiddleware;
+module.exports.requireSuperAdmin = requireSuperAdmin;

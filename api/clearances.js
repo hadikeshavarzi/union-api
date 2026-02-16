@@ -10,21 +10,6 @@ function toNumber(v) {
     return Number.isFinite(n) ? n : 0;
 }
 
-async function getMemberId(userId) {
-    if (!userId) return null;
-    try {
-        const res = await pool.query("SELECT id FROM members WHERE auth_user_id = $1", [userId]);
-        if (res.rows.length === 0) {
-            const fallback = await pool.query("SELECT id FROM members LIMIT 1");
-            return fallback.rows.length > 0 ? fallback.rows[0].id : null;
-        }
-        return res.rows[0].id;
-    } catch (err) {
-        console.error("Error getting member id:", err);
-        return null;
-    }
-}
-
 async function generateClearanceNo(memberId) {
     try {
         const res = await pool.query("SELECT count(*) as count FROM clearances WHERE member_id = $1", [memberId]);
@@ -382,11 +367,7 @@ router.post("/", authMiddleware, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        let member_id = await getMemberId(req.user.id);
-        if (!member_id) {
-            const fb = await client.query("SELECT id FROM members LIMIT 1");
-            member_id = fb.rows[0]?.id;
-        }
+        const member_id = req.user.member_id;
 
         const {
             customer_id, clearance_date, 
@@ -514,7 +495,12 @@ router.get("/report", authMiddleware, async (req, res) => {
             SELECT 
                 c.*, 
                 cust.name as customer_name,
-                cust.description as customer_desc
+                cust.description as customer_desc,
+                EXISTS (
+                    SELECT 1 FROM loading_order_items li
+                    JOIN clearance_items ci ON ci.id = li.clearance_item_id
+                    WHERE ci.clearance_id = c.id
+                ) AS has_loading
             FROM clearances c
             LEFT JOIN customers cust ON cust.id = c.customer_id
             ORDER BY c.clearance_date DESC
@@ -548,8 +534,8 @@ router.get("/report", authMiddleware, async (req, res) => {
         });
         const output = clearances.map(c => ({
             ...c,
-            customer: { id: c.customer_id, label: c.customer_name || "بدون نام" },
-            clearance_items: itemsByClearance[c.id] || []
+            customer: { id: c.customer_id, name: c.customer_name || "بدون نام" },
+            items: itemsByClearance[c.id] || []
         }));
         res.json({ success: true, data: output });
     } catch (e) {
@@ -586,6 +572,70 @@ router.get("/:clearanceId/items", authMiddleware, async (req, res) => {
     } catch (e) {
         console.error(e);
         res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+/* ============================================================
+   6) DELETE /api/clearances/:id - حذف حواله ترخیص
+   فقط اگر هنوز بارگیری نشده باشد
+============================================================ */
+router.delete("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const clearanceId = req.params.id;
+        const member_id = req.user.member_id;
+
+        await client.query('BEGIN');
+
+        // بررسی وجود سند
+        const { rows: clRows } = await client.query(
+            `SELECT id FROM clearances WHERE id = $1 AND member_id = $2`,
+            [clearanceId, member_id]
+        );
+        if (!clRows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ success: false, error: "سند یافت نشد" });
+        }
+
+        // بررسی اینکه آیا بارگیری شده یا نه
+        const { rows: loadedItems } = await client.query(
+            `SELECT li.id FROM loading_order_items li
+             JOIN clearance_items ci ON ci.id = li.clearance_item_id
+             WHERE ci.clearance_id = $1 LIMIT 1`,
+            [clearanceId]
+        );
+        if (loadedItems.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ success: false, error: "این حواله قبلاً بارگیری شده و قابل حذف نیست" });
+        }
+
+        // حذف تراکنش‌های مرتبط
+        await client.query(
+            `DELETE FROM inventory_transactions WHERE ref_clearance_id = $1`,
+            [clearanceId]
+        );
+
+        // حذف آیتم‌ها
+        await client.query(
+            `DELETE FROM clearance_items WHERE clearance_id = $1`,
+            [clearanceId]
+        );
+
+        // حذف هدر
+        await client.query(
+            `DELETE FROM clearances WHERE id = $1`,
+            [clearanceId]
+        );
+
+        await client.query('COMMIT');
+        return res.json({ success: true, message: "حواله با موفقیت حذف شد" });
+
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error("❌ DELETE /clearances/:id error:", e.message);
+        return res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
     }
 });
 

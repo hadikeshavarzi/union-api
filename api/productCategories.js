@@ -1,6 +1,7 @@
 // api/productCategories.js - GLOBAL MODE (No owner_id)
 const express = require("express");
 const authMiddleware = require("./middleware/auth");
+const { requireSuperAdmin } = require("./middleware/auth");
 const { pool } = require("../supabaseAdmin");
 const router = express.Router();
 
@@ -80,8 +81,8 @@ router.get("/:id", authMiddleware, async (req, res) => {
     }
 });
 
-// CREATE
-router.post("/", authMiddleware, async (req, res) => {
+// CREATE (فقط سوپرادمین)
+router.post("/", authMiddleware, requireSuperAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         // حذف owner_id از ورودی
@@ -113,8 +114,8 @@ router.post("/", authMiddleware, async (req, res) => {
     } finally { client.release(); }
 });
 
-// UPDATE
-router.put("/:id", authMiddleware, async (req, res) => {
+// UPDATE (فقط سوپرادمین)
+router.put("/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const { id } = req.params;
@@ -151,8 +152,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
     } finally { client.release(); }
 });
 
-// DELETE
-router.delete("/:id", authMiddleware, async (req, res) => {
+// DELETE (فقط سوپرادمین)
+router.delete("/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         if (!isUUID(id)) return res.status(400).json({ success: false, error: "Invalid ID" });

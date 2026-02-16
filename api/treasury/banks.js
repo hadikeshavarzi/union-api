@@ -8,7 +8,7 @@ const authMiddleware = require("../middleware/auth");
 // ============================================================
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { limit = 100, offset = 0, search, with_tafsili } = req.query;
 
         const params = [member_id];
@@ -60,8 +60,8 @@ router.get("/", authMiddleware, async (req, res) => {
 // ============================================================
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         const sql = `
             SELECT tb.*, 
@@ -90,7 +90,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
     const client = await pool.connect(); // شروع تراکنش
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const body = req.body;
 
         if (!body.bank_name) {
@@ -162,8 +162,8 @@ router.post("/", authMiddleware, async (req, res) => {
 router.put("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
         const body = req.body;
 
         // چک کردن وجود بانک
@@ -221,8 +221,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.delete("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         // دریافت اطلاعات برای حذف تفصیلی
         const checkRes = await client.query(

@@ -16,7 +16,7 @@ async function pickMapById(client, table, ids, selectCols = "*") {
     const uniqueIds = [...new Set(ids.filter(Boolean))];
     if (uniqueIds.length === 0) return {};
 
-    const query = `SELECT ${selectCols} FROM public.${table} WHERE id = ANY($1::int[])`;
+    const query = `SELECT ${selectCols} FROM public.${table} WHERE id = ANY($1::uuid[])`;
     const { rows } = await client.query(query, [uniqueIds]);
 
     const map = {};
@@ -27,11 +27,10 @@ async function pickMapById(client, table, ids, selectCols = "*") {
 // تولید شماره خروج
 async function generateExitNo(client, memberId) {
     const { rows } = await client.query(
-        `SELECT COUNT(*) as count FROM public.warehouse_exits WHERE member_id = $1`,
+        `SELECT COALESCE(MAX(exit_no), 9000) AS max_no FROM public.warehouse_exits WHERE member_id = $1`,
         [memberId]
     );
-    const count = Number(rows[0]?.count || 0);
-    return (Number(memberId) * 1000) + 9000 + (count + 1);
+    return Number(rows[0]?.max_no || 9000) + 1;
 }
 
 function toNum(v, d = 0) {
@@ -44,9 +43,8 @@ function toNum(v, d = 0) {
 ============================================================ */
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const memberId = req.user.id; // فرض بر اینکه id عددی است، اگر authMiddleware آیدی عددی ست می‌کند
+        const memberId = req.user.member_id;
 
-        // دریافت لیست خروج‌ها
         const { rows: exits } = await pool.query(
             `SELECT * FROM public.warehouse_exits WHERE member_id = $1 ORDER BY created_at DESC`,
             [memberId]
@@ -67,13 +65,13 @@ router.get("/", authMiddleware, async (req, res) => {
 
         // دریافت آیتم‌های خروج
         const { rows: allItems } = await pool.query(
-            `SELECT * FROM public.warehouse_exit_items WHERE warehouse_exit_id = ANY($1::int[])`,
+            `SELECT * FROM public.warehouse_exit_items WHERE warehouse_exit_id = ANY($1::uuid[])`,
             [exitIds]
         );
 
         // دریافت اطلاعات کالای مرتبط با آیتم‌ها
         const loadingItemIds = allItems.map(i => i.loading_item_id);
-        const loadingItemsMap = await pickMapById(pool, "loading_order_items", loadingItemIds, "id,batch_no,product_id,qty");
+        const loadingItemsMap = await pickMapById(pool, "loading_order_items", loadingItemIds, "id,batch_no,product_id,qty,weight");
 
         const productIds = Object.values(loadingItemsMap).map(li => li.product_id);
         const productsMap = await pickMapById(pool, "products", productIds, "id,name");
@@ -89,10 +87,14 @@ router.get("/", authMiddleware, async (req, res) => {
             itemsByExit[it.warehouse_exit_id].push({
                 id: it.id,
                 qty: it.qty,
+                weight_full: it.weight_full,
+                weight_empty: it.weight_empty,
                 weight_net: it.weight_net,
                 fee_price: it.fee_price,
                 loading_fee: it.loading_fee,
                 final_fee: it.final_fee,
+                clearance_qty: li?.qty || 0,
+                clearance_weight: li?.weight || 0,
                 loading_item: {
                     batch_no: li?.batch_no,
                     product: { name: pr?.name },
@@ -122,12 +124,12 @@ router.get("/", authMiddleware, async (req, res) => {
 router.get("/search/:term", authMiddleware, async (req, res) => {
     try {
         const term = req.params.term;
-        const memberId = req.user.id;
+        const memberId = req.user.member_id;
 
         let exitRecord = null;
         let loadingOrderRecord = null;
 
-        // A) جستجو در loading_orders
+        // A) جستجو در loading_orders با order_no
         const { rows: loRows } = await pool.query(
             `SELECT * FROM public.loading_orders WHERE order_no = $1 AND member_id = $2`,
             [term, memberId]
@@ -135,7 +137,6 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
 
         if (loRows.length > 0) {
             const loadingOrder = loRows[0];
-            // چک کنیم آیا خروج دارد؟
             const { rows: exRows } = await pool.query(
                 `SELECT * FROM public.warehouse_exits WHERE loading_order_id = $1 AND member_id = $2`,
                 [loadingOrder.id, memberId]
@@ -145,8 +146,9 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
             else loadingOrderRecord = loadingOrder;
         }
 
-        // B) جستجو با ID خروج (اگر پیدا نشد و term عدد بود)
-        if (!exitRecord && !loadingOrderRecord && !isNaN(term)) {
+        // B) جستجو با UUID خروج (فقط اگر term فرمت UUID باشد)
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        if (!exitRecord && !loadingOrderRecord && uuidRegex.test(term)) {
             const { rows: exRows } = await pool.query(
                 `SELECT * FROM public.warehouse_exits WHERE id = $1 AND member_id = $2`,
                 [term, memberId]
@@ -171,18 +173,24 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
             const liMap = await pickMapById(pool, "loading_order_items", exitItems.map(i => i.loading_item_id), "*");
             const prodMap = await pickMapById(pool, "products", Object.values(liMap).map(i => i.product_id), "*");
 
+            // نرخ‌ها از دسته‌بندی
+            const catIds = [...new Set(Object.values(prodMap).map(p => p.category_id).filter(Boolean))];
+            const catMap = catIds.length > 0 ? await pickMapById(pool, "product_categories", catIds, "id,storage_cost,loading_cost,fee_type") : {};
+
             const formattedItems = exitItems.map(it => {
                 const li = liMap[it.loading_item_id];
                 const pr = li ? prodMap[li.product_id] : null;
+                const cat = pr?.category_id ? catMap[pr.category_id] : null;
                 return {
                     item_id: it.loading_item_id,
                     product_name: pr?.name || "نامشخص",
                     batch_no: li?.batch_no,
                     qty: toNum(it.qty),
-                    entry_date: it.created_at, // ساده‌سازی
-                    fee_type: pr?.fee_type || "weight",
-                    base_storage_rate: toNum(pr?.effective_storage_cost),
-                    base_loading_rate: toNum(pr?.effective_loading_cost),
+                    cleared_weight: toNum(li?.weight),
+                    entry_date: it.created_at,
+                    fee_type: cat?.fee_type || "weight",
+                    base_storage_rate: toNum(cat?.storage_cost),
+                    base_loading_rate: toNum(cat?.loading_cost),
                     weight_full: toNum(it.weight_full),
                     weight_empty: toNum(it.weight_empty),
                     weight_net: toNum(it.weight_net),
@@ -199,14 +207,20 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
                     status: exitRecord.status,
                     exit_id: exitRecord.id,
                     loading_id: exitRecord.loading_order_id,
+                    exit_no: exitRecord.exit_no,
                     order_no: loMap[exitRecord.loading_order_id]?.order_no,
                     driver_name: exitRecord.driver_name,
                     plate_number: exitRecord.plate_number,
+                    driver_national_code: exitRecord.driver_national_code,
                     customer_name: custMap[exitRecord.owner_id]?.name,
                     customer_id: exitRecord.owner_id,
                     weighbridge_fee: exitRecord.weighbridge_fee,
                     extra_fee: exitRecord.extra_fee,
+                    extra_description: exitRecord.extra_description,
                     payment_method: exitRecord.payment_method,
+                    financial_account_id: exitRecord.financial_account_id,
+                    exit_date: exitRecord.exit_date,
+                    reference_no: exitRecord.reference_no,
                     items: formattedItems
                 }
             });
@@ -217,17 +231,49 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
             const { rows: loadItems } = await pool.query(`SELECT * FROM public.loading_order_items WHERE loading_order_id = $1`, [loadingOrderRecord.id]);
             const prodMap = await pickMapById(pool, "products", loadItems.map(i => i.product_id), "*");
 
+            // نرخ‌ها از دسته‌بندی محصول
+            const catIds = [...new Set(Object.values(prodMap).map(p => p.category_id).filter(Boolean))];
+            const catMap = catIds.length > 0 ? await pickMapById(pool, "product_categories", catIds, "id,storage_cost,loading_cost,fee_type") : {};
+
+            // مشتری از طریق clearance
+            let customerId = null;
+            let customerName = null;
+            if (loadingOrderRecord.clearance_id) {
+                const { rows: clRows } = await pool.query(`SELECT customer_id FROM public.clearances WHERE id = $1`, [loadingOrderRecord.clearance_id]);
+                if (clRows.length > 0 && clRows[0].customer_id) {
+                    customerId = clRows[0].customer_id;
+                    const custMap = await pickMapById(pool, "customers", [customerId], "id,name");
+                    customerName = custMap[customerId]?.name || null;
+                }
+            }
+
+            // تاریخ ورود (تاریخ رسید) برای محاسبه هوشمند
+            const entryDateMap = {};
+            if (customerId) {
+                const { rows: entryRows } = await pool.query(`
+                    SELECT ri.product_id, MIN(r.doc_date) AS entry_date
+                    FROM receipt_items ri
+                    JOIN receipts r ON r.id = ri.receipt_id
+                    WHERE r.owner_id = $1 AND r.status = 'final'
+                      AND ri.product_id = ANY($2::uuid[])
+                    GROUP BY ri.product_id
+                `, [customerId, loadItems.map(i => i.product_id)]);
+                entryRows.forEach(row => { entryDateMap[row.product_id] = row.entry_date; });
+            }
+
             const formattedItems = loadItems.map(li => {
                 const pr = prodMap[li.product_id];
+                const cat = pr?.category_id ? catMap[pr.category_id] : null;
                 return {
                     item_id: li.id,
                     product_name: pr?.name,
                     batch_no: li.batch_no,
                     qty: toNum(li.qty),
-                    entry_date: new Date().toISOString(),
-                    fee_type: pr?.fee_type || "weight",
-                    base_storage_rate: toNum(pr?.effective_storage_cost),
-                    base_loading_rate: toNum(pr?.effective_loading_cost),
+                    cleared_weight: toNum(li.weight),
+                    entry_date: entryDateMap[li.product_id] || loadingOrderRecord.loading_date || new Date().toISOString(),
+                    fee_type: cat?.fee_type || "weight",
+                    base_storage_rate: toNum(cat?.storage_cost),
+                    base_loading_rate: toNum(cat?.loading_cost),
                     weight_full: 0, weight_empty: 0, weight_net: 0,
                     row_storage_fee: 0, row_loading_fee: 0
                 };
@@ -242,7 +288,8 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
                     order_no: loadingOrderRecord.order_no,
                     driver_name: loadingOrderRecord.driver_name,
                     plate_number: loadingOrderRecord.plate_number,
-                    customer_id: loadingOrderRecord.customer_id,
+                    customer_id: customerId,
+                    customer_name: customerName,
                     items: formattedItems
                 }
             });
@@ -260,10 +307,11 @@ router.get("/search/:term", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const memberId = req.user.id;
+        const memberId = req.user.member_id;
+
         const payload = req.body;
 
-        await client.query('BEGIN'); // 🚀 شروع تراکنش
+        await client.query('BEGIN');
 
         const exitNo = await generateExitNo(client, memberId);
 
@@ -309,7 +357,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
         await client.query('COMMIT'); // ✅ پایان موفق
 
-        return res.json({ success: true, id: header.id, message: "خروج با موفقیت ثبت شد" });
+        return res.json({ success: true, id: header.id, exit_no: header.exit_no, message: "خروج با موفقیت ثبت شد" });
 
     } catch (e) {
         await client.query('ROLLBACK'); // ❌ بازگشت در صورت خطا
@@ -326,7 +374,7 @@ router.post("/", authMiddleware, async (req, res) => {
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
         const exitId = req.params.id;
-        const memberId = req.user.id;
+        const memberId = req.user.member_id;
 
         const { rows } = await pool.query(
             `SELECT * FROM public.warehouse_exits WHERE id = $1 AND member_id = $2`,
@@ -336,7 +384,6 @@ router.get("/:id", authMiddleware, async (req, res) => {
         if (rows.length === 0) return res.status(404).json({ success: false, error: "سند یافت نشد" });
         const header = rows[0];
 
-        // دریافت اطلاعات وابسته
         const [loMap, custMap] = await Promise.all([
             pickMapById(pool, "loading_orders", [header.loading_order_id], "id,order_no"),
             pickMapById(pool, "customers", [header.owner_id], "id,name")
@@ -384,11 +431,10 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
         const exitId = req.params.id;
-        const memberId = req.user.id;
+        const memberId = req.user.member_id;
 
         await client.query('BEGIN');
 
-        // چک کردن مالکیت
         const { rows } = await client.query(
             `SELECT id, loading_order_id FROM public.warehouse_exits WHERE id = $1 AND member_id = $2`,
             [exitId, memberId]

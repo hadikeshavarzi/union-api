@@ -13,22 +13,6 @@ function toNumber(v) {
     return Number.isFinite(n) ? n : 0;
 }
 
-// Helper: دریافت ID ممبر
-async function getMemberId(userId) {
-    if (!userId) return null;
-    try {
-        const res = await pool.query("SELECT id FROM members WHERE auth_user_id = $1", [userId]);
-        if (res.rows.length === 0) {
-            const fallback = await pool.query("SELECT id FROM members LIMIT 1");
-            return fallback.rows.length > 0 ? fallback.rows[0].id : null;
-        }
-        return res.rows[0].id;
-    } catch (err) {
-        console.error("Error getting member id:", err);
-        return null;
-    }
-}
-
 // Helper: دریافت موجودی لحظه‌ای یک ردیف
 async function getBatchStock(memberId, ownerId, productId, batchNo) {
     try {
@@ -59,11 +43,7 @@ router.post("/", authMiddleware, async (req, res) => {
     try {
         await client.query('BEGIN');
 
-        let member_id = await getMemberId(req.user.id);
-        if (!member_id) {
-             const fb = await client.query("SELECT id FROM members LIMIT 1");
-             member_id = fb.rows[0]?.id;
-        }
+        const member_id = req.user.member_id;
 
         const { clearance_id, product_id, qty, weight, parent_batch_no, new_batch_no, ...rest } = req.body;
 

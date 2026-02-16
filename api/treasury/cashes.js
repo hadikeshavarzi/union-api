@@ -23,7 +23,7 @@ async function generateNextTafsiliCode(client, memberId, type) {
 // 1. لیست صندوق‌ها (GET)
 router.get("/", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { with_tafsili } = req.query;
 
         let sql = `
@@ -46,8 +46,8 @@ router.get("/", authMiddleware, async (req, res) => {
 // 2. دریافت یک صندوق (GET One)
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         const sql = `
             SELECT tc.*, 
@@ -71,7 +71,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 router.post("/", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const { title, initial_balance, description, is_active } = req.body;
 
         if (!title) return res.status(400).json({ success: false, error: "عنوان صندوق الزامی است" });
@@ -122,8 +122,8 @@ router.post("/", authMiddleware, async (req, res) => {
 router.put("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
         const { title, initial_balance, description, is_active } = req.body;
 
         const checkRes = await client.query("SELECT id, tafsili_id FROM public.treasury_cashes WHERE id=$1 AND member_id=$2", [id, member_id]);
@@ -161,8 +161,8 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.delete("/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
-        const id = parseInt(req.params.id);
-        const member_id = req.user.id;
+        const id = req.params.id;
+        const member_id = req.user.member_id;
 
         const checkRes = await client.query("SELECT id, tafsili_id FROM public.treasury_cashes WHERE id=$1 AND member_id=$2", [id, member_id]);
         if (checkRes.rowCount === 0) return res.status(404).json({ success: false, error: "صندوق یافت نشد" });

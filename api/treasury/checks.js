@@ -12,10 +12,11 @@ router.get("/", authMiddleware, async (req, res) => {
             status, // pending, passed, bounced, ...
             type,   // payable, receivable
             limit = 100,
-            search
+            search,
+            checkbook_id
         } = req.query;
 
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         // کوئری با اتصال به دسته‌چک و بانک
         let queryText = `
@@ -47,6 +48,12 @@ router.get("/", authMiddleware, async (req, res) => {
             paramCounter++;
         }
 
+        if (checkbook_id) {
+            queryText += ` AND c.checkbook_id = $${paramCounter}`;
+            queryParams.push(checkbook_id);
+            paramCounter++;
+        }
+
         if (search) {
             queryText += ` AND (c.check_number ILIKE $${paramCounter} OR c.sayad_number ILIKE $${paramCounter})`;
             queryParams.push(`%${search}%`);
@@ -69,7 +76,7 @@ router.get("/", authMiddleware, async (req, res) => {
 router.get("/:id", authMiddleware, async (req, res) => {
     try {
         const id = req.params.id;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         const query = `
             SELECT * FROM public.treasury_checks 
@@ -91,7 +98,7 @@ router.get("/:id", authMiddleware, async (req, res) => {
 /* CREATE CHECK (صدور چک) */
 router.post("/", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const body = req.body;
 
         const payload = { ...body, member_id };
@@ -137,7 +144,7 @@ router.post("/", authMiddleware, async (req, res) => {
 router.put("/:id", authMiddleware, async (req, res) => {
     try {
         const id = req.params.id;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
         const payload = { ...req.body };
 
         delete payload.id;
@@ -176,7 +183,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 router.delete("/:id", authMiddleware, async (req, res) => {
     try {
         const id = req.params.id;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         // فقط چک‌های پاس نشده (pending) قابل حذف هستند
         const checkStatus = await pool.query(

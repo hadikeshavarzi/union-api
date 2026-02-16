@@ -1,7 +1,8 @@
 // api/productUnits.js - SQL Based (Postgres) - COMPLETE
 const express = require("express");
 const authMiddleware = require("./middleware/auth");
-const { pool } = require("../supabaseAdmin"); // ✅ فقط pool
+const { requireSuperAdmin } = require("./middleware/auth");
+const { pool } = require("../supabaseAdmin");
 
 const router = express.Router();
 
@@ -94,7 +95,7 @@ router.get("/:id", async (req, res) => {
 /* ============================================================================
    CREATE – ایجاد واحد جدید (Protected)
 ============================================================================ */
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, requireSuperAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const payload = normalizeUnit(req.body);
@@ -148,7 +149,7 @@ router.post("/", authMiddleware, async (req, res) => {
 /* ============================================================================
    UPDATE – ویرایش واحد (Protected)
 ============================================================================ */
-router.put("/:id", authMiddleware, async (req, res) => {
+router.put("/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const id = parseInt(req.params.id, 10);
@@ -211,7 +212,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
 /* ============================================================================
    PATCH – تغییر جزئی (Protected)  (اختیاری ولی خیلی کاربردی)
 ============================================================================ */
-router.patch("/:id", authMiddleware, async (req, res) => {
+router.patch("/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     const client = await pool.connect();
     try {
         const id = parseInt(req.params.id, 10);
@@ -279,7 +280,7 @@ router.patch("/:id", authMiddleware, async (req, res) => {
 /* ============================================================================
    DELETE – حذف واحد (Protected)
 ============================================================================ */
-router.delete("/:id", authMiddleware, async (req, res) => {
+router.delete("/:id", authMiddleware, requireSuperAdmin, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         if (!Number.isFinite(id)) {
