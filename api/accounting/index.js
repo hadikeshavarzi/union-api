@@ -12,7 +12,7 @@ const router = express.Router();
 router.get("/documents", authMiddleware, async (req, res) => {
     try {
         const { search, limit = 500 } = req.query;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         let queryText = `
             SELECT
@@ -59,7 +59,7 @@ router.get("/documents", authMiddleware, async (req, res) => {
 router.get("/documents/:id", authMiddleware, async (req, res) => {
     try {
         const id = req.params.id;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         const query = `
             SELECT 
@@ -123,7 +123,7 @@ router.post("/documents", authMiddleware, async (req, res) => {
         const finalNo = manual_no || req.body.header?.manual_no;
         const finalEntries = entries || req.body.entries;
 
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         if (!finalEntries || finalEntries.length === 0) {
             return res.status(400).json({ success: false, error: "سند باید حداقل یک ردیف داشته باشد" });
@@ -186,7 +186,7 @@ router.delete("/documents/:id", authMiddleware, async (req, res) => {
     const client = await pool.connect();
     try {
         const id = req.params.id;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         await client.query('BEGIN');
 

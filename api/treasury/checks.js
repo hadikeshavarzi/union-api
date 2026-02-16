@@ -24,8 +24,9 @@ router.get("/", authMiddleware, async (req, res) => {
                 c.*,
                 json_build_object(
                     'id', cb.id,
-                    'sayad_id', cb.sayad_id,
-                    'bank_name', b.name
+                    'serial_start', cb.serial_start,
+                    'serial_end', cb.serial_end,
+                    'bank_name', b.bank_name
                 ) as checkbook
             FROM public.treasury_checks c
             LEFT JOIN public.treasury_checkbooks cb ON c.checkbook_id = cb.id
