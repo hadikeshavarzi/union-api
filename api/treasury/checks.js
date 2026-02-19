@@ -26,11 +26,18 @@ router.get("/", authMiddleware, async (req, res) => {
                     'id', cb.id,
                     'serial_start', cb.serial_start,
                     'serial_end', cb.serial_end,
+                    'bank_id', cb.bank_id,
                     'bank_name', b.bank_name
-                ) as checkbook
+                ) as checkbook,
+                json_build_object(
+                    'id', tb.id,
+                    'bank_name', tb.bank_name,
+                    'account_no', tb.account_no
+                ) as target_bank
             FROM public.treasury_checks c
             LEFT JOIN public.treasury_checkbooks cb ON c.checkbook_id = cb.id
             LEFT JOIN public.treasury_banks b ON cb.bank_id = b.id
+            LEFT JOIN public.treasury_banks tb ON c.target_bank_id = tb.id
             WHERE c.member_id = $1
         `;
 
@@ -192,11 +199,7 @@ router.post("/:id/pass", authMiddleware, async (req, res) => {
     try {
         const id = req.params.id;
         const member_id = req.user.member_id;
-        const { bank_id, pass_date, description } = req.body;
-
-        if (!bank_id) {
-            return res.status(400).json({ success: false, error: "حساب بانک جهت واریز/برداشت الزامی است" });
-        }
+        const { bank_id: explicitBankId, pass_date, description } = req.body;
 
         const checkRes = await client.query(
             "SELECT * FROM public.treasury_checks WHERE id = $1 AND member_id = $2",
@@ -209,6 +212,20 @@ router.post("/:id/pass", authMiddleware, async (req, res) => {
 
         if (cheque.status === 'passed' || cheque.status === 'cashed') {
             return res.status(400).json({ success: false, error: "این چک قبلاً پاس شده است" });
+        }
+
+        let bank_id = explicitBankId || cheque.target_bank_id;
+
+        if (!bank_id && cheque.checkbook_id) {
+            const cbRes = await client.query(
+                "SELECT bank_id FROM public.treasury_checkbooks WHERE id = $1",
+                [cheque.checkbook_id]
+            );
+            if (cbRes.rows.length > 0) bank_id = cbRes.rows[0].bank_id;
+        }
+
+        if (!bank_id) {
+            return res.status(400).json({ success: false, error: "حساب بانک مشخص نیست. لطفا بانک را انتخاب کنید." });
         }
 
         const bankRes = await client.query(
