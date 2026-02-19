@@ -11,7 +11,7 @@ const router = express.Router();
 // ============================================================
 router.get("/documents", authMiddleware, async (req, res) => {
     try {
-        const { search, limit = 500 } = req.query;
+        const { search, limit = 500, date_from, date_to, doc_type } = req.query;
         const member_id = req.user.member_id;
 
         let queryText = `
@@ -19,10 +19,10 @@ router.get("/documents", authMiddleware, async (req, res) => {
                 d.id,
                 d.doc_date,
                 d.description,
-                d.manual_no,   -- شماره دستی
-                d.doc_no,      -- شماره سیستمی (اگر در دیتابیس باشد)
+                d.manual_no,
+                d.doc_no,
                 d.status,
-                d.doc_type,    -- نوع سند (system/manual)
+                d.doc_type,
                 d.created_at,
                 (SELECT COALESCE(SUM(bed), 0) FROM public.financial_entries WHERE doc_id = d.id) as total_amount
             FROM public.financial_documents d
@@ -32,13 +32,31 @@ router.get("/documents", authMiddleware, async (req, res) => {
         const queryParams = [member_id];
         let paramCounter = 2;
 
+        if (date_from) {
+            queryText += ` AND d.doc_date >= $${paramCounter}`;
+            queryParams.push(date_from);
+            paramCounter++;
+        }
+
+        if (date_to) {
+            queryText += ` AND d.doc_date <= $${paramCounter}`;
+            queryParams.push(date_to);
+            paramCounter++;
+        }
+
+        if (doc_type && doc_type !== 'all') {
+            queryText += ` AND d.doc_type = $${paramCounter}`;
+            queryParams.push(doc_type);
+            paramCounter++;
+        }
+
         if (search) {
-            queryText += ` AND (d.description ILIKE $${paramCounter} OR d.manual_no ILIKE $${paramCounter})`;
+            queryText += ` AND (d.description ILIKE $${paramCounter} OR d.manual_no ILIKE $${paramCounter} OR d.doc_no ILIKE $${paramCounter})`;
             queryParams.push(`%${search}%`);
             paramCounter++;
         }
 
-        queryText += ` GROUP BY d.id ORDER BY d.doc_date DESC, d.id DESC LIMIT $${paramCounter}`;
+        queryText += ` ORDER BY d.doc_date DESC, d.created_at DESC LIMIT $${paramCounter}`;
         queryParams.push(Number(limit));
 
         const result = await pool.query(queryText, queryParams);
