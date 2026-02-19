@@ -10,8 +10,8 @@ const authMiddleware = require("../middleware/auth");
 // ============================================================
 router.get("/balances", authMiddleware, async (req, res) => {
     try {
-        const { type } = req.query; // 'customer', 'supplier', etc.
-        const member_id = req.user.id;
+        const { type } = req.query;
+        const member_id = req.user.member_id;
 
         // ✅ اصلاح شده: اتصال به جدول customers برای گرفتن موبایل
         let query = `
@@ -61,8 +61,8 @@ router.get("/balances", authMiddleware, async (req, res) => {
 // ============================================================
 router.get("/treasury-balances", authMiddleware, async (req, res) => {
     try {
-        const { type } = req.query; // 'bank' or 'cash'
-        const member_id = req.user.id;
+        const { type } = req.query;
+        const member_id = req.user.member_id;
 
         if (type === 'bank') {
             // 1. دریافت بانک‌ها
@@ -167,7 +167,7 @@ router.get("/treasury-balances", authMiddleware, async (req, res) => {
 // ============================================================
 router.get("/trial-balance", authMiddleware, async (req, res) => {
     try {
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         // محاسبه سطح معین (کد، نام، جمع بدهکار، جمع بستانکار، مانده)
         const query = `
@@ -204,7 +204,7 @@ router.get("/ledger/:tafsiliId", authMiddleware, async (req, res) => {
     try {
         const { tafsiliId } = req.params;
         const { startDate, endDate } = req.query;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         // 1. بررسی نوع تفصیلی (اگر بانک است، پوزها را هم پیدا کن تا گردش تجمیعی نشان دهیم)
         const { rows: bankCheck } = await pool.query(
@@ -275,7 +275,7 @@ router.get("/ledger/:tafsiliId", authMiddleware, async (req, res) => {
 router.get("/ledger", authMiddleware, async (req, res) => {
     try {
         const { moeinId, tafsiliId, startDate, endDate } = req.query;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         let query = `
             SELECT 
@@ -326,7 +326,7 @@ router.get("/ledger", authMiddleware, async (req, res) => {
 router.get("/journal", authMiddleware, async (req, res) => {
     try {
         const { startDate, endDate } = req.query;
-        const member_id = req.user.id;
+        const member_id = req.user.member_id;
 
         // استفاده از JSON_AGG برای برگرداندن سند به همراه ردیف‌هایش در یک کوئری
         let query = `
