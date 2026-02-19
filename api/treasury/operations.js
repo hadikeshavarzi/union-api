@@ -10,6 +10,8 @@ const findMoeinId = async (client, code) => {
     return res.rows.length > 0 ? res.rows[0].id : null;
 };
 
+const nullIfEmpty = (v) => (v === '' || v === undefined || v === null) ? null : v;
+
 const generateDocNo = async (client, member_id) => {
     const res = await client.query(
         'SELECT MAX(doc_no::INTEGER) as max_no FROM public.financial_documents WHERE member_id = $1',
@@ -277,9 +279,9 @@ router.post("/transactions", authMiddleware, async (req, res) => {
                             account_holder, description, checkbook_id
                         ) VALUES ($1, 'receivable', $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
                     `, [
-                        member_id, item.cheque_no, item.sayadi_code,
-                        amount, item.due_date, item.bank_name,
-                        item.account_holder, item.description, item.checkbook_id
+                        member_id, item.cheque_no, nullIfEmpty(item.sayadi_code),
+                        amount, nullIfEmpty(item.due_date), nullIfEmpty(item.bank_name),
+                        nullIfEmpty(item.account_holder), nullIfEmpty(item.description), nullIfEmpty(item.checkbook_id)
                     ]);
                 }
             } else {
@@ -313,9 +315,9 @@ router.post("/transactions", authMiddleware, async (req, res) => {
                             account_holder, description, checkbook_id
                         ) VALUES ($1, 'payable', $2, $3, $4, $5, 'issued', $6, $7, $8, $9)
                         `, [
-                            member_id, item.cheque_no, item.sayadi_code,
-                            amount, item.due_date, item.bank_name,
-                            item.account_holder, item.description, item.checkbook_id
+                            member_id, item.cheque_no, nullIfEmpty(item.sayadi_code),
+                            amount, nullIfEmpty(item.due_date), nullIfEmpty(item.bank_name),
+                            nullIfEmpty(item.account_holder), nullIfEmpty(item.description), nullIfEmpty(item.checkbook_id)
                         ]);
                     } else {
                         // spend_customer - using a received cheque
