@@ -56,7 +56,7 @@ router.get("/", authMiddleware, async (req, res) => {
         }
 
         if (search) {
-            queryText += ` AND (c.check_number ILIKE $${paramCounter} OR c.sayad_number ILIKE $${paramCounter})`;
+            queryText += ` AND (c.cheque_no ILIKE $${paramCounter} OR c.sayadi_code ILIKE $${paramCounter})`;
             queryParams.push(`%${search}%`);
             paramCounter++;
         }
@@ -107,10 +107,10 @@ router.post("/", authMiddleware, async (req, res) => {
         delete payload.created_at;
 
         // چک تکراری بودن شماره چک در آن دسته‌چک
-        if (payload.checkbook_id && payload.check_number) {
+        if (payload.checkbook_id && payload.cheque_no) {
             const checkExist = await pool.query(
-                `SELECT id FROM public.treasury_checks WHERE checkbook_id = $1 AND check_number = $2`,
-                [payload.checkbook_id, payload.check_number]
+                `SELECT id FROM public.treasury_checks WHERE checkbook_id = $1 AND cheque_no = $2`,
+                [payload.checkbook_id, payload.cheque_no]
             );
             if (checkExist.rows.length > 0) {
                 return res.status(409).json({ success: false, error: "این شماره چک قبلاً ثبت شده است" });

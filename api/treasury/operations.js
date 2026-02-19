@@ -272,7 +272,7 @@ router.post("/transactions", authMiddleware, async (req, res) => {
                     // Register the cheque in treasury_checks
                     await client.query(`
                         INSERT INTO public.treasury_checks (
-                            member_id, type, check_number, sayad_number, 
+                            member_id, type, cheque_no, sayadi_code, 
                             amount, due_date, status, bank_name, 
                             account_holder, description, checkbook_id
                         ) VALUES ($1, 'receivable', $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
@@ -308,10 +308,10 @@ router.post("/transactions", authMiddleware, async (req, res) => {
 
                         await client.query(`
                             INSERT INTO public.treasury_checks (
-                                member_id, type, check_number, sayad_number, 
-                                amount, due_date, status, bank_name, 
-                                account_holder, description, checkbook_id
-                            ) VALUES ($1, 'payable', $2, $3, $4, $5, 'issued', $6, $7, $8, $9)
+                            member_id, type, cheque_no, sayadi_code, 
+                            amount, due_date, status, bank_name, 
+                            account_holder, description, checkbook_id
+                        ) VALUES ($1, 'payable', $2, $3, $4, $5, 'issued', $6, $7, $8, $9)
                         `, [
                             member_id, item.cheque_no, item.sayadi_code,
                             amount, item.due_date, item.bank_name,
