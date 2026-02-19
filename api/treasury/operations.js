@@ -229,13 +229,13 @@ router.post("/transactions", authMiddleware, async (req, res) => {
 
         // Moein codes
         const MOEIN_CODES = {
-            cash: "10101",        // صندوق
-            bank: "10103",        // بانک
-            pos: "10104",         // کارتخوان
-            customer: "10301",    // حساب‌های دریافتنی / اشخاص
-            cheque_recv: "10201", // اسناد دریافتنی
-            cheque_pay: "20101",  // اسناد پرداختنی
-            fee: "70101"          // هزینه کارمزد بانکی
+            cash: "10101",        // صندوق ریالی
+            bank: "10103",        // بانک‌های ریالی
+            pos: "10104",         // موجودی نزد کارتخوان
+            customer: "10301",    // حساب‌های دریافتنی (مشتریان)
+            cheque_recv: "10302", // اسناد دریافتنی (چک‌ها)
+            cheque_pay: "30102",  // اسناد پرداختنی
+            fee: "80205"          // هزینه‌های کارمزد بانک
         };
 
         // Process each item
@@ -338,6 +338,7 @@ router.post("/transactions", authMiddleware, async (req, res) => {
 
             // Insert debit entry
             const debitMoeinId = await findMoeinId(client, debitMoeinCode);
+            if (!debitMoeinId) throw new Error(`حساب معین با کد ${debitMoeinCode} یافت نشد. لطفاً ابتدا سرفصل‌های حسابداری را تعریف کنید.`);
             await client.query(`
                 INSERT INTO public.financial_entries 
                 (doc_id, member_id, moein_id, tafsili_id, bed, bes, description)
@@ -346,6 +347,7 @@ router.post("/transactions", authMiddleware, async (req, res) => {
 
             // Insert credit entry
             const creditMoeinId = await findMoeinId(client, creditMoeinCode);
+            if (!creditMoeinId) throw new Error(`حساب معین با کد ${creditMoeinCode} یافت نشد. لطفاً ابتدا سرفصل‌های حسابداری را تعریف کنید.`);
             await client.query(`
                 INSERT INTO public.financial_entries 
                 (doc_id, member_id, moein_id, tafsili_id, bed, bes, description)
@@ -451,7 +453,7 @@ router.post("/transfer", authMiddleware, async (req, res) => {
 
         // Fee entry if applicable
         if (feeVal > 0) {
-            const feeMoeinId = await findMoeinId(client, '70101');
+            const feeMoeinId = await findMoeinId(client, '80205');
             await client.query(`
                 INSERT INTO public.financial_entries 
                 (doc_id, member_id, moein_id, tafsili_id, bed, bes, description)
