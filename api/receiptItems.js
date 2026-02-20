@@ -1,6 +1,6 @@
 // api/receiptItems.js - COMPLETE MULTI-TENANT VERSION
 const express = require("express");
-const { supabaseAdmin } = require("../supabaseAdmin");
+const { supabaseAdmin, pool } = require("../supabaseAdmin");
 const authMiddleware = require("./middleware/auth");
 
 const router = express.Router();
@@ -47,9 +47,75 @@ const sanitize = (body, fields) =>
     Object.fromEntries(Object.entries(body).filter(([k]) => fields.includes(k)));
 
 /* ============================================================
+   GET PARENT ROWS - ردیف حواله‌های ثبت‌شده برای یک مشتری
+============================================================ */
+router.get("/parent-rows", authMiddleware, async (req, res) => {
+  try {
+    const { owner_id } = req.query;
+    const member_id = req.user.member_id;
+    if (!owner_id) return res.status(400).json({ success: false, error: "owner_id الزامی است" });
+
+    const sql = `
+      SELECT DISTINCT ON (ri.parent_row, ri.product_id)
+        ri.parent_row, ri.product_id, ri.owner_id, p.name AS product_name
+      FROM public.receipt_items ri
+      JOIN public.receipts r ON r.id = ri.receipt_id
+      LEFT JOIN public.products p ON p.id = ri.product_id
+      WHERE ri.owner_id = $1 AND r.member_id = $2
+        AND ri.parent_row IS NOT NULL AND ri.parent_row != ''
+      ORDER BY ri.parent_row, ri.product_id`;
+
+    const result = await pool.query(sql, [owner_id, member_id]);
+
+    return res.json({ success: true, data: result.rows });
+  } catch (e) {
+    console.error("Parent Rows Error:", e);
+    return res.status(500).json({ success: false, error: "خطای داخلی سرور" });
+  }
+});
+
+/* ============================================================
+   CHECK PARENT ROW UNIQUENESS
+============================================================ */
+router.get("/check-parent-row", authMiddleware, async (req, res) => {
+  try {
+    const { parent_row, product_id, owner_id } = req.query;
+    const member_id = req.user.member_id;
+    if (!parent_row) return res.json({ success: true, data: { exists: false } });
+
+    const sql = `
+      SELECT ri.id, ri.product_id, ri.owner_id
+      FROM public.receipt_items ri
+      JOIN public.receipts r ON r.id = ri.receipt_id
+      WHERE ri.parent_row = $1 AND r.member_id = $2
+      LIMIT 10`;
+
+    const result = await pool.query(sql, [parent_row, member_id]);
+
+    if (!result.rows.length) return res.json({ success: true, data: { exists: false } });
+
+    const conflict = result.rows.find(item =>
+        String(item.product_id) !== String(product_id) || String(item.owner_id) !== String(owner_id)
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        exists: true,
+        conflict: !!conflict,
+        conflictProductId: conflict?.product_id || null,
+        conflictOwnerId: conflict?.owner_id || null,
+      }
+    });
+  } catch (e) {
+    console.error("Check Parent Row Error:", e);
+    return res.status(500).json({ success: false, error: "خطای داخلی سرور" });
+  }
+});
+
+/* ============================================================
    GET ALL RECEIPT ITEMS (لیست آیتم‌ها)
 ============================================================ */
-// api/receiptItems.js - SECURE VERSION با چک دوباره
 
 /* ============================================================
    GET ALL RECEIPT ITEMS - نسخه امن

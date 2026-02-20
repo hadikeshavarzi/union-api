@@ -27,6 +27,7 @@ async function generateClearanceNo(memberId) {
 router.get("/owner-inventory/:ownerId", authMiddleware, async (req, res) => {
     try {
         const owner_id = req.params.ownerId;
+        const memberId = req.user.member_id || req.user.id;
 
         const query = `
             SELECT
@@ -34,20 +35,15 @@ router.get("/owner-inventory/:ownerId", authMiddleware, async (req, res) => {
                 p.name                     AS product_title,
                 pc.name                    AS category_name,
                 COALESCE(NULLIF(t.batch_no,''), 'بدون ردیف') AS batch_no,
-
-                -- ورودی: همه تراکنش‌های type=in (رسید، حواله فرزند، ...)
                 SUM(CASE WHEN t.type = 'in' THEN ABS(t.qty) ELSE 0 END)    AS in_qty,
                 SUM(CASE WHEN t.type = 'in' THEN ABS(t.weight) ELSE 0 END) AS in_weight,
-
-                -- خروجی: همه تراکنش‌های type=out (حواله، ترخیص، بارگیری، ...)
                 SUM(CASE WHEN t.type = 'out' THEN ABS(t.qty) ELSE 0 END)    AS out_qty,
                 SUM(CASE WHEN t.type = 'out' THEN ABS(t.weight) ELSE 0 END) AS out_weight,
-
                 MIN(t.created_at) AS first_date
             FROM inventory_transactions t
             LEFT JOIN products p            ON p.id  = t.product_id
             LEFT JOIN product_categories pc ON pc.id = p.category_id
-            WHERE t.owner_id = $1
+            WHERE t.owner_id = $1 AND t.member_id = $2
               AND t.type IN ('in', 'out')
             GROUP BY t.product_id, p.name, pc.name,
                      COALESCE(NULLIF(t.batch_no,''), 'بدون ردیف')
@@ -57,16 +53,15 @@ router.get("/owner-inventory/:ownerId", authMiddleware, async (req, res) => {
             ORDER BY COALESCE(NULLIF(t.batch_no,''), 'بدون ردیف') ASC, p.name ASC
         `;
 
-        const { rows } = await pool.query(query, [owner_id]);
+        const { rows } = await pool.query(query, [owner_id, memberId]);
 
-        // --- find max child index per batch ---
         const childQuery = `
             SELECT DISTINCT batch_no
             FROM inventory_transactions
-            WHERE owner_id = $1
+            WHERE owner_id = $1 AND member_id = $2
               AND batch_no LIKE '%/%'
         `;
-        const { rows: childRows } = await pool.query(childQuery, [owner_id]);
+        const { rows: childRows } = await pool.query(childQuery, [owner_id, memberId]);
 
         // build map: parentBatch -> maxChildIndex
         const childMap = {};
@@ -112,30 +107,28 @@ router.get("/owner-inventory/:ownerId", authMiddleware, async (req, res) => {
 ============================================================ */
 router.get("/owner-products/:ownerId", authMiddleware, async (req, res) => {
     try {
-        const owner_id = req.params.ownerId; 
+        const owner_id = req.params.ownerId;
+        const memberId = req.user.member_id || req.user.id;
         const query = `
             SELECT 
                 t.product_id,
                 p.name as product_title,
                 pc.name as category_name,
-                -- منبع (Source): در دیتابیس havaleh است
                 SUM(CASE WHEN t.transaction_type IN ('havaleh', 'allocation', 'remittance', 'order', 'حواله') THEN ABS(t.qty) ELSE 0 END) as total_in_qty,
                 SUM(CASE WHEN t.transaction_type IN ('havaleh', 'allocation', 'remittance', 'order', 'حواله') THEN ABS(t.weight) ELSE 0 END) as total_in_weight,
-                
-                -- کسر (Deduction): در دیتابیس clearance/out است
                 SUM(CASE WHEN t.type = 'out' OR t.transaction_type IN ('clearance', 'exit', 'loading') THEN ABS(t.qty) ELSE 0 END) as total_out_qty,
                 SUM(CASE WHEN t.type = 'out' OR t.transaction_type IN ('clearance', 'exit', 'loading') THEN ABS(t.weight) ELSE 0 END) as total_out_weight
             FROM inventory_transactions t
             LEFT JOIN products p ON p.id = t.product_id
             LEFT JOIN product_categories pc ON pc.id = p.category_id
-            WHERE t.owner_id = $1
+            WHERE t.owner_id = $1 AND t.member_id = $2
             GROUP BY t.product_id, p.name, pc.name
             HAVING 
                 (SUM(CASE WHEN t.transaction_type IN ('havaleh', 'allocation', 'remittance', 'order', 'حواله') THEN ABS(t.qty) ELSE 0 END) - 
                  SUM(CASE WHEN t.type = 'out' OR t.transaction_type IN ('clearance', 'exit', 'loading') THEN ABS(t.qty) ELSE 0 END)) > 0
         `;
 
-        const { rows } = await pool.query(query, [owner_id]);
+        const { rows } = await pool.query(query, [owner_id, memberId]);
 
         const summary = rows.map(row => ({
             product_id: row.product_id,
@@ -160,6 +153,7 @@ router.get("/owner-products/:ownerId", authMiddleware, async (req, res) => {
 router.get("/lookup-row/:ownerId", authMiddleware, async (req, res) => {
     try {
         const owner_id = req.params.ownerId;
+        const memberId = req.user.member_id || req.user.id;
         const batch_no = req.query.batch_no;
 
         if (!batch_no) return res.status(400).json({ success: false, error: "batch_no الزامی است" });
@@ -177,12 +171,12 @@ router.get("/lookup-row/:ownerId", authMiddleware, async (req, res) => {
             FROM inventory_transactions t
             LEFT JOIN products p ON p.id = t.product_id
             LEFT JOIN product_categories pc ON pc.id = p.category_id
-            WHERE t.owner_id = $1
+            WHERE t.owner_id = $1 AND t.member_id = $3
               AND COALESCE(NULLIF(t.batch_no, ''), 'بدون ردیف') = $2
             GROUP BY t.product_id, p.name, pc.name, COALESCE(NULLIF(t.batch_no, ''), 'بدون ردیف')
         `;
 
-        const { rows } = await pool.query(query, [owner_id, batch_no]);
+        const { rows } = await pool.query(query, [owner_id, batch_no, memberId]);
 
         if (rows.length === 0) {
             return res.json({ success: true, data: null, message: "ردیفی یافت نشد" });
@@ -198,8 +192,9 @@ router.get("/lookup-row/:ownerId", authMiddleware, async (req, res) => {
             FROM inventory_transactions
             WHERE owner_id = $1
               AND batch_no LIKE $2
+              AND member_id = $3
         `;
-        const { rows: childRows } = await pool.query(childQuery, [owner_id, batch_no + '/%']);
+        const { rows: childRows } = await pool.query(childQuery, [owner_id, batch_no + '/%', memberId]);
 
         let maxChildIndex = 0;
         childRows.forEach(cr => {
@@ -232,6 +227,7 @@ router.get("/lookup-row/:ownerId", authMiddleware, async (req, res) => {
 ============================================================ */
 router.get("/batches", authMiddleware, async (req, res) => {
     try {
+        const memberId = req.user.member_id || req.user.id;
         const owner_id = req.query.owner_id;
         const product_id = req.query.product_id;
 
@@ -302,7 +298,7 @@ router.get("/batches", authMiddleware, async (req, res) => {
                     ) as exit_history
 
                 FROM inventory_transactions
-                WHERE owner_id = $1 AND product_id = $2
+                WHERE owner_id = $1 AND product_id = $2 AND member_id = $3
                 
                 -- فیلتر: فقط رکوردهای مرتبط
                 AND (
@@ -341,7 +337,7 @@ router.get("/batches", authMiddleware, async (req, res) => {
             ORDER BY first_date ASC
         `;
 
-        const { rows } = await pool.query(query, [owner_id, product_id]);
+        const { rows } = await pool.query(query, [owner_id, product_id, memberId]);
 
         const result = rows.map(row => ({
             batch_no: row.batch_no,
@@ -491,6 +487,7 @@ router.post("/", authMiddleware, async (req, res) => {
 ============================================================ */
 router.get("/report", authMiddleware, async (req, res) => {
     try {
+        const memberId = req.user.member_id || req.user.id;
         const query = `
             SELECT 
                 c.*, 
@@ -503,10 +500,11 @@ router.get("/report", authMiddleware, async (req, res) => {
                 ) AS has_loading
             FROM clearances c
             LEFT JOIN customers cust ON cust.id = c.customer_id
+            WHERE c.member_id = $1
             ORDER BY c.clearance_date DESC
             LIMIT 500
         `;
-        const { rows: clearances } = await pool.query(query);
+        const { rows: clearances } = await pool.query(query, [memberId]);
         if (clearances.length === 0) return res.json({ success: true, data: [] });
 
         const ids = clearances.map(c => c.id);
@@ -549,6 +547,7 @@ router.get("/report", authMiddleware, async (req, res) => {
 ============================================================ */
 router.get("/:clearanceId/items", authMiddleware, async (req, res) => {
     try {
+        const memberId = req.user.member_id || req.user.id;
         const { clearanceId } = req.params;
         const query = `
             SELECT ci.*, p.name as product_name, c.clearance_date,
@@ -560,9 +559,9 @@ router.get("/:clearanceId/items", authMiddleware, async (req, res) => {
             FROM clearance_items ci
             LEFT JOIN products p ON p.id = ci.product_id
             LEFT JOIN clearances c ON c.id = ci.clearance_id
-            WHERE ci.clearance_id = $1 ORDER BY ci.created_at
+            WHERE ci.clearance_id = $1 AND c.member_id = $2 ORDER BY ci.created_at
         `;
-        const { rows } = await pool.query(query, [clearanceId]);
+        const { rows } = await pool.query(query, [clearanceId, memberId]);
         const items = rows.map(row => ({
             ...row,
             product: { id: row.product_id, title: row.product_name },

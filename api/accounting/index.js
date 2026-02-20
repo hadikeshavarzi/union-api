@@ -24,7 +24,17 @@ router.get("/documents", authMiddleware, async (req, res) => {
                 d.status,
                 d.doc_type,
                 d.created_at,
-                (SELECT COALESCE(SUM(bed), 0) FROM public.financial_entries WHERE doc_id = d.id) as total_amount
+                (SELECT COALESCE(SUM(bed), 0) FROM public.financial_entries WHERE doc_id = d.id) as total_amount,
+                (SELECT json_agg(json_build_object(
+                    'id', e.id, 'bed', e.bed, 'bes', e.bes, 'description', e.description,
+                    'moein_id', e.moein_id, 'tafsili_id', e.tafsili_id,
+                    'accounting_moein', json_build_object('code', m.code, 'title', m.title),
+                    'accounting_tafsili', CASE WHEN t.id IS NOT NULL THEN json_build_object('code', t.code, 'title', t.title) ELSE NULL END
+                ) ORDER BY e.id)
+                FROM public.financial_entries e
+                LEFT JOIN public.accounting_moein m ON m.id = e.moein_id
+                LEFT JOIN public.accounting_tafsili t ON t.id = e.tafsili_id
+                WHERE e.doc_id = d.id) as financial_entries
             FROM public.financial_documents d
             WHERE d.member_id = $1
         `;
@@ -149,19 +159,25 @@ router.post("/documents", authMiddleware, async (req, res) => {
 
         await client.query('BEGIN');
 
-        // 1. ثبت هدر سند
+        const { rows: noRows } = await client.query(
+            "SELECT COALESCE(MAX(doc_no), 0) + 1 AS next_no FROM public.financial_documents WHERE member_id = $1",
+            [member_id]
+        );
+        const nextDocNo = noRows[0].next_no;
+
         const docQuery = `
             INSERT INTO public.financial_documents 
-            (member_id, doc_date, description, manual_no, status, created_at)
-            VALUES ($1, $2, $3, $4, 'confirmed', NOW())
-            RETURNING id
+            (member_id, doc_date, description, manual_no, doc_no, doc_type, status, created_at)
+            VALUES ($1, $2, $3, $4, $5, 'manual', 'confirmed', NOW())
+            RETURNING id, doc_no
         `;
 
         const docRes = await client.query(docQuery, [
             member_id,
             finalDate,
             finalDesc,
-            finalNo
+            finalNo,
+            nextDocNo
         ]);
         const newDocId = docRes.rows[0].id;
 
@@ -197,7 +213,50 @@ router.post("/documents", authMiddleware, async (req, res) => {
     }
 });
 // ============================================================
-// 4. حذف سند (Delete)
+// 4-A. ویرایش سند (Update)
+// آدرس نهایی: PUT /api/accounting/documents/:id
+// ============================================================
+router.put("/documents/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const id = req.params.id;
+        const member_id = req.user.member_id;
+        const { doc_date, description, manual_no, entries } = req.body;
+
+        const existing = await client.query("SELECT id, doc_type FROM public.financial_documents WHERE id = $1 AND member_id = $2", [id, member_id]);
+        if (!existing.rows.length) return res.status(404).json({ success: false, error: "سند یافت نشد" });
+        if (existing.rows[0].doc_type === "system") return res.status(400).json({ success: false, error: "اسناد سیستمی قابل ویرایش نیستند" });
+
+        await client.query("BEGIN");
+
+        await client.query(
+            "UPDATE public.financial_documents SET doc_date = COALESCE($1, doc_date), description = COALESCE($2, description), manual_no = COALESCE($3, manual_no) WHERE id = $4",
+            [doc_date || null, description || null, manual_no || null, id]
+        );
+
+        if (entries && Array.isArray(entries) && entries.length > 0) {
+            await client.query("DELETE FROM public.financial_entries WHERE doc_id = $1", [id]);
+            for (const e of entries) {
+                await client.query(
+                    "INSERT INTO public.financial_entries (doc_id, moein_id, tafsili_id, bed, bes, description, member_id) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    [id, e.moein_id, e.tafsili_id || null, e.bed || 0, e.bes || 0, e.description || "", member_id]
+                );
+            }
+        }
+
+        await client.query("COMMIT");
+        res.json({ success: true, message: "سند ویرایش شد" });
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("Accounting Update Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    } finally {
+        client.release();
+    }
+});
+
+// ============================================================
+// 4-B. حذف سند (Delete)
 // آدرس نهایی: DELETE /api/accounting/documents/:id
 // ============================================================
 router.delete("/documents/:id", authMiddleware, async (req, res) => {

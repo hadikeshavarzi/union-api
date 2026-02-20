@@ -35,6 +35,7 @@ function formatPlate(plateObj) {
 ============================================================ */
 router.get("/customers-with-clearances", authMiddleware, async (req, res) => {
     try {
+        const memberId = req.user.member_id || req.user.id;
         const query = `
             SELECT DISTINCT
                 c.id,
@@ -49,11 +50,12 @@ router.get("/customers-with-clearances", authMiddleware, async (req, res) => {
             LEFT JOIN loading_order_items li ON li.clearance_item_id = ci.id
             WHERE ci.status = 'issued'
               AND cl.status = 'final'
+              AND cl.member_id = $1
               AND li.id IS NULL
             GROUP BY c.id, c.name, c.mobile, c.national_id, c.customer_type
             ORDER BY name
         `;
-        const { rows } = await pool.query(query);
+        const { rows } = await pool.query(query, [memberId]);
         res.json({ success: true, data: rows });
     } catch (e) {
         console.error("❌ customers-with-clearances error:", e.message);
@@ -67,6 +69,7 @@ router.get("/customers-with-clearances", authMiddleware, async (req, res) => {
 ============================================================ */
 router.get("/pending-items/:customerId", authMiddleware, async (req, res) => {
     try {
+        const memberId = req.user.member_id || req.user.id;
         const customerId = req.params.customerId;
         const query = `
             SELECT
@@ -97,22 +100,23 @@ router.get("/pending-items/:customerId", authMiddleware, async (req, res) => {
             LEFT JOIN product_categories pc ON pc.id = p.category_id
             LEFT JOIN loading_order_items li ON li.clearance_item_id = ci.id
             WHERE cl.customer_id = $1
+              AND cl.member_id = $2
               AND ci.status = 'issued'
               AND cl.status = 'final'
               AND li.id IS NULL
-              -- فیلتر: اگر ردیف فرزند دارد، نمایش نده (فقط آخرین سطح نستد بیاد)
               AND NOT EXISTS (
                   SELECT 1 FROM clearance_items ci2
                   JOIN clearances cl2 ON cl2.id = ci2.clearance_id
                   WHERE ci2.parent_batch_no = ci.new_batch_no
                     AND cl2.customer_id = $1
+                    AND cl2.member_id = $2
                     AND ci2.status = 'issued'
                     AND cl2.status = 'final'
                     AND ci2.product_id = ci.product_id
               )
             ORDER BY cl.clearance_no ASC, ci.created_at ASC
         `;
-        const { rows } = await pool.query(query, [customerId]);
+        const { rows } = await pool.query(query, [customerId, memberId]);
         res.json({ success: true, data: rows });
     } catch (e) {
         console.error("❌ pending-items error:", e.message);

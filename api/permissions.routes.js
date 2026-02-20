@@ -178,21 +178,24 @@ router.post('/ui-forms', async (req, res) => {
     // تبدیل رشته خالی به null برای دیتابیس
     const permCodeValue = permission_code && permission_code.trim() !== '' ? permission_code : null;
 
+    const memberId = req.user.member_id || req.user.id;
+    const formCode = (path || title || '').replace(/\//g, '.').replace(/^\./, '') || 'form';
+    const route = path || '/';
+
     if (id) {
-      // ویرایش فرم موجود
       await db.query(
         `UPDATE ui_forms SET 
-          title=$1, path=$2, icon=$3, module=$4, menu_order=$5, is_active=$6, permission_code=$7, updated_at=NOW() 
-         WHERE id=$8`,
-        [title, path, icon, module, menu_order || 0, is_active, permCodeValue, id]
+          title=$1, path=$2, icon=$3, module=$4, menu_order=$5, is_active=$6, permission_code=$7, 
+          form_code=$8, route=$9, updated_at=NOW() 
+         WHERE id=$10`,
+        [title, path, icon, module, menu_order || 0, is_active, permCodeValue, formCode, route, id]
       );
       return res.json({ success: true, message: 'بروزرسانی انجام شد' });
     } else {
-      // ایجاد فرم جدید
       const result = await db.query(
-        `INSERT INTO ui_forms (title, path, icon, module, menu_order, is_active, permission_code) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-        [title, path, icon, module, menu_order || 0, is_active, permCodeValue]
+        `INSERT INTO ui_forms (member_id, form_code, title, route, path, icon, module, menu_order, is_active, permission_code) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+        [memberId, formCode, title, route, path, icon, module, menu_order || 0, is_active, permCodeValue]
       );
       return res.json({ success: true, data: result.rows[0], message: 'فرم جدید ثبت شد' });
     }

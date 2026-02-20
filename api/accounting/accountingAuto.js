@@ -19,7 +19,7 @@ const COST_MAP = [
     { field: "unloadCost",    moein: MOEIN.INCOME_LOADING,   label: "تخلیه" },
     { field: "loadCost",      moein: MOEIN.INCOME_OTHER,     label: "کرایه حمل" },
     { field: "tax",           moein: MOEIN.VAT,              label: "مالیات" },
-    { field: "returnFreight", moein: MOEIN.INCOME_OTHER,     label: "کرایه برگشت" },
+    { field: "returnFreight", moein: MOEIN.INCOME_OTHER,     label: "پسکرایه" },
     { field: "miscCost",      moein: MOEIN.INCOME_OTHER,     label: "سایر" },
 ];
 

@@ -39,13 +39,11 @@ app.use(cors({
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use('/uploads', express.static(require('path').join(__dirname, 'uploads')));
 
-// لاگ ساده
-app.use((req, res, next) => {
-    const auth = req.headers.authorization ? '🔐' : '⚠️';
-    console.log(`${auth} ${req.method} ${req.path}`);
-    next();
-});
+// Activity Logger Middleware (باید قبل از روت‌ها باشد)
+const activityLogger = require('./api/middleware/activityLogger');
+app.use(activityLogger);
 
 // =======================================
 // تابع کمکی
@@ -114,6 +112,21 @@ mountRoute('/api/treasury-checkbooks', './api/treasury/checkbooks');
 mountRoute('/api/treasury-checks', './api/treasury/checks');
 mountRoute('/api/treasury', './api/treasury/operations');
 mountRoute('/api/treasury', './api/treasury/index');
+
+// --- Rentals ---
+mountRoute('/api/rentals', './api/rentals');
+
+// --- Calendar ---
+mountRoute('/api/calendar', './api/calendar');
+
+// --- Settings ---
+mountRoute('/api/settings', './api/settings');
+
+// --- Activity Logs ---
+mountRoute('/api/activity-logs', './api/activityLog');
+
+// --- Tickets & Support ---
+mountRoute('/api/tickets', './api/tickets');
 
 // --- Reports & Members ---
 mountRoute('/api/reports', './api/reports/index');
