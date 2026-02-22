@@ -4,39 +4,55 @@ const axios = require("axios");
 
 const router = express.Router();
 
-router.post("/", async (req, res) => {
-  console.log("==================================================");
-  console.log("🔵 CUSTOMER OTP REQUEST");
-  console.log("📥 Body:", req.body);
-  console.log("==================================================");
+async function getWarehouseName(memberId) {
+  if (!memberId) return "انبار";
+  try {
+    const { rows } = await pool.query(
+      "SELECT warehouse_name FROM warehouse_settings WHERE member_id = $1", [memberId]
+    );
+    return rows[0]?.warehouse_name || "انبار";
+  } catch { return "انبار"; }
+}
 
+function buildClearanceSmsText(customerName, otp, metadata, warehouseName) {
+  const items = Array.isArray(metadata.items) ? metadata.items : [];
+  const itemLines = items.map(it => {
+    const parts = [];
+    if (it.batch) parts.push(`ردیف: ${it.batch}`);
+    parts.push(it.product || "کالا");
+    if (it.qty) parts.push(`تعداد: ${Number(it.qty).toLocaleString("fa-IR")}`);
+    if (it.weight) parts.push(`وزن: ${Number(it.weight).toLocaleString("fa-IR")}`);
+    return parts.join(" | ");
+  }).join("\n");
+
+  let text = `مشتری گرامی ${customerName}\n`;
+  text += `کالا با مشخصات زیر ترخیص میشود:\n`;
+  if (itemLines) text += `${itemLines}\n`;
+  if (metadata.receiverName) text += `نام طرف: ${metadata.receiverName}\n`;
+  if (metadata.receiverNationalId) text += `کد ملی: ${metadata.receiverNationalId}\n`;
+  if (metadata.plate) text += `پلاک: ${metadata.plate}\n`;
+  text += `کد تایید: ${otp}\n`;
+  text += `به منزله اطلاع کامل از ترخیص کالا میباشد.\n`;
+  text += warehouseName;
+
+  return text;
+}
+
+router.post("/", async (req, res) => {
   try {
     const { mobile, metadata } = req.body;
 
     if (!mobile) {
-      return res.status(400).json({
-        success: false,
-        error: "شماره موبایل الزامی است",
-      });
+      return res.status(400).json({ success: false, error: "شماره موبایل الزامی است" });
     }
 
-    console.log("🔍 Searching customer with mobile:", mobile);
-
     const { rows } = await pool.query(
-      `SELECT id, name, mobile 
-       FROM public.customers 
-       WHERE mobile = $1 
-       LIMIT 1`,
+      "SELECT c.id, c.name, c.mobile, c.member_id FROM public.customers c WHERE c.mobile = $1 LIMIT 1",
       [mobile]
     );
 
-    console.log("📊 Query result:", rows);
-
-    if (rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: "مشتری با این شماره موبایل یافت نشد",
-      });
+    if (!rows.length) {
+      return res.status(404).json({ success: false, error: "مشتری با این شماره موبایل یافت نشد" });
     }
 
     const customer = rows[0];
@@ -44,45 +60,55 @@ router.post("/", async (req, res) => {
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await pool.query(
-      `UPDATE public.customers 
-       SET otp_code = $1, otp_expires = $2
-       WHERE id = $3`,
+      "UPDATE public.customers SET otp_code = $1, otp_expires = $2 WHERE id = $3",
       [otp, expiresAt, customer.id]
     );
 
-    console.log(`✅ OTP Generated: ${otp} for ${customer.name}`);
+    console.log(`📨 Customer OTP for ${customer.name} (${mobile}): ${otp}`);
 
-    if (process.env.MELIPAYAMAK_USERNAME) {
+    const username = process.env.MELIPAYAMAK_USERNAME;
+    const password = process.env.MELIPAYAMAK_PASSWORD;
+    const from = process.env.SMS_SENDER_NUMBER;
+
+    if (username && password && from) {
       try {
-        let smsText = `${customer.name} عزیز\nکد تایید: ${otp}\n`;
-        if (metadata?.product) smsText += `کالا: ${metadata.product}`;
+        let smsText;
 
-        await axios.post("https://rest.payamak-panel.com/api/SendSMS/SendSMS", {
-          username: process.env.MELIPAYAMAK_USERNAME,
-          password: process.env.MELIPAYAMAK_PASSWORD,
-          to: mobile,
-          from: process.env.SMS_SENDER_NUMBER,
-          text: smsText,
-          isflash: false,
-        });
+        if (metadata?.type === "clearance") {
+          const warehouseName = await getWarehouseName(customer.member_id);
+          smsText = buildClearanceSmsText(customer.name, otp, metadata, warehouseName);
+        } else {
+          smsText = `${customer.name} عزیز\nکد تایید: ${otp}\nسامانه مدیریت انبار`;
+          if (metadata?.product) smsText += `\nکالا: ${metadata.product}`;
+        }
+
+        const smsResponse = await axios.post(
+          "https://rest.payamak-panel.com/api/SendSMS/SendSMS",
+          {
+            username, password,
+            to: mobile, from,
+            text: smsText,
+            isflash: false,
+          },
+          { timeout: 15000, proxy: false }
+        );
+        console.log(`✅ Customer SMS sent to ${mobile}:`, JSON.stringify(smsResponse.data));
       } catch (smsErr) {
-        console.error("SMS Error:", smsErr.message);
+        console.error(`❌ Customer SMS Error for ${mobile}:`, smsErr.response?.data || smsErr.message);
       }
+    } else {
+      console.warn("⚠️ SMS credentials missing");
     }
 
     return res.json({
       success: true,
       status: 200,
       message: "کد تایید ارسال شد",
-      ...(process.env.NODE_ENV === 'development' && { debug_otp: otp })
     });
 
   } catch (err) {
-    console.error("❌ ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    console.error("❌ CUSTOMER OTP ERROR:", err);
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 

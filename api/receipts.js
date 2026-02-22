@@ -3,6 +3,7 @@ const router = express.Router();
 const { pool } = require("../supabaseAdmin");
 const authMiddleware = require("./middleware/auth");
 const { generateReceiptAccounting } = require("./accounting/accountingAuto");
+const { sendReceiptSms } = require("./utils/sms");
 
 const isUUID = (str) => str && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
 const toYMD = (v) => { if (!v) return null; const d = new Date(v); return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10); };
@@ -97,7 +98,7 @@ router.post("/", authMiddleware, async (req, res) => {
             else throw new Error("نوع سند یافت نشد");
         }
 
-        const maxRes = await client.query("SELECT COALESCE(MAX(receipt_no::bigint), 1000) as max_no FROM public.receipts");
+        const maxRes = await client.query("SELECT COALESCE(MAX(receipt_no::bigint), 1000) as max_no FROM public.receipts WHERE member_id = $1", [member_id]);
         const nextNo = (Number(maxRes.rows[0].max_no) + 1).toString();
         const doc_date = toYMD(b.doc_date) || toYMD(new Date());
 
@@ -184,7 +185,7 @@ router.post("/", authMiddleware, async (req, res) => {
 
             const newItemId = itemRes.rows[0].id;
             if (b.status !== "draft") {
-                const batchNo = item.row_code || item.bundle_no || item.heat_number || "";
+                const batchNo = item.parent_row || item.row_code || item.bundle_no || item.heat_number || "";
                 await client.query(`
                     INSERT INTO public.inventory_transactions (
                         type, transaction_type, ref_receipt_id, reference_id,
@@ -213,6 +214,19 @@ router.post("/", authMiddleware, async (req, res) => {
 
         await client.query("COMMIT");
         res.json({ success: true, data: { id: newReceiptId, receipt_no: nextNo } });
+
+        if (b.status === "final") {
+            const smsItems = items.map(it => ({
+                productName: it.product_name || it.productName || "",
+                qty: it.qty || it.count || 0,
+                weight: Math.abs((Number(it.weights_full) || 0) - (Number(it.weights_empty) || 0)),
+                batchNo: it.parent_row || "",
+            }));
+            sendReceiptSms({
+                memberId: member_id, receiptNo: nextNo, customerId: b.owner_id,
+                items: smsItems, docDate: doc_date,
+            }).catch(e => console.error("SMS error:", e.message));
+        }
     } catch (e) {
         await client.query("ROLLBACK");
         console.error("POST Receipt Error:", e);
@@ -319,7 +333,7 @@ router.put("/:id", authMiddleware, async (req, res) => {
             ]);
             const newItemId = itemRes.rows[0].id;
             if (newStatus === "final") {
-                const batchNo = item.row_code || item.bundle_no || item.heat_number || "";
+                const batchNo = item.parent_row || item.row_code || item.bundle_no || item.heat_number || "";
                 await client.query(`
                     INSERT INTO public.inventory_transactions (
                         type, transaction_type, ref_receipt_id, reference_id,
@@ -352,6 +366,62 @@ router.put("/:id", authMiddleware, async (req, res) => {
         await client.query("ROLLBACK");
         console.error("PUT Receipt Error:", e);
         res.status(500).json({ success: false, error: e.message });
+    } finally { client.release(); }
+});
+
+router.delete("/:id", authMiddleware, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const receiptId = req.params.id;
+        const memberId = req.user.member_id || req.user.id;
+        if (!isUUID(receiptId)) return res.status(400).json({ success: false, error: "شناسه نامعتبر" });
+
+        await client.query("BEGIN");
+
+        const { rows: rRows } = await client.query(
+            "SELECT id, status FROM receipts WHERE id = $1 AND member_id = $2",
+            [receiptId, memberId]
+        );
+        if (!rRows.length) {
+            await client.query("ROLLBACK");
+            return res.status(404).json({ success: false, error: "رسید یافت نشد" });
+        }
+
+        const deps = [];
+        const { rows: clItems } = await client.query(
+            `SELECT COUNT(*)::int AS cnt FROM clearance_items ci
+             JOIN clearances c ON c.id = ci.clearance_id
+             WHERE ci.owner_id IN (SELECT owner_id FROM receipts WHERE id = $1)
+               AND ci.product_id IN (SELECT product_id FROM receipt_items WHERE receipt_id = $1)
+               AND c.member_id = $2`, [receiptId, memberId]
+        );
+        if (clItems[0]?.cnt > 0) deps.push(`${clItems[0].cnt} ردیف ترخیص`);
+
+        const { rows: itRows } = await client.query(
+            `SELECT COUNT(*)::int AS cnt FROM inventory_transactions
+             WHERE ref_receipt_id = $1 AND type = 'out'`, [receiptId]
+        );
+        if (itRows[0]?.cnt > 0) deps.push(`${itRows[0].cnt} تراکنش خروج`);
+
+        if (deps.length > 0) {
+            await client.query("ROLLBACK");
+            return res.status(400).json({
+                success: false,
+                error: `امکان حذف وجود ندارد. فرآیندهای زیر برای این رسید ثبت شده: ${deps.join("، ")}`,
+                dependencies: deps,
+            });
+        }
+
+        await client.query("DELETE FROM inventory_transactions WHERE ref_receipt_id = $1", [receiptId]);
+        await client.query("DELETE FROM receipt_items WHERE receipt_id = $1", [receiptId]);
+        await client.query("DELETE FROM receipts WHERE id = $1", [receiptId]);
+
+        await client.query("COMMIT");
+        return res.json({ success: true, message: "رسید با موفقیت حذف شد" });
+    } catch (e) {
+        await client.query("ROLLBACK");
+        console.error("DELETE Receipt Error:", e);
+        return res.status(500).json({ success: false, error: e.message });
     } finally { client.release(); }
 });
 

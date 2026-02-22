@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../supabaseAdmin');
 const authMiddleware = require('./middleware/auth');
+const { sendRentalSms } = require('./utils/sms');
 
 const nullIfEmpty = (v) => (v === '' || v === undefined || v === null) ? null : v;
 
@@ -166,6 +167,14 @@ router.post('/', authMiddleware, async (req, res) => {
         ]);
 
         res.json({ success: true, data: rows[0] });
+
+        if (rows[0]?.status === 'active') {
+            sendRentalSms({
+                memberId: member_id, customerId: customer_id,
+                locationName: location_name, monthlyRent: monthly_rent,
+                startDate: start_date, billingCycle: billing_cycle || 'monthly',
+            }).catch(e => console.error("Rental SMS error:", e.message));
+        }
     } catch (e) {
         console.error('❌ Create Rental Error:', e);
         res.status(500).json({ success: false, error: e.message });

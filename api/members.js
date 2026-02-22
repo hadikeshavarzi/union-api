@@ -3,6 +3,11 @@ const router = express.Router();
 const { randomUUID } = require("crypto");
 const { pool } = require("../supabaseAdmin");
 const auth = require("./middleware/auth");
+const { sendSms } = require("./utils/sms");
+
+function buildWelcomeSms(fullName) {
+    return `جناب ${fullName || "کاربر گرامی"}\nثبت نام شما در سامانه مدیریت انبار تکمیل گردید.\nبرای استفاده از سامانه لطفا به لینک زیر مراجعه نمایید و با همین شماره موبایل لاگین نمایید.\nportal.anbardaranrey.ir\nلغو11`;
+}
 
 const MEMBER_SELECT_COLUMNS = `
     id,
@@ -47,8 +52,14 @@ const REQUIRED_NOT_NULL_FIELDS = {
     role: "نقش کاربر الزامی است",
     full_name: "نام و نام خانوادگی الزامی است",
     mobile: "شماره موبایل الزامی است",
-    member_code: "کد عضویت الزامی است",
 };
+
+async function generateMemberCode(client) {
+    const { rows } = await (client || pool).query(
+        "SELECT COALESCE(MAX(CAST(member_code AS bigint)), 1000) AS max_code FROM members WHERE member_code ~ '^[0-9]+$'"
+    );
+    return String(Number(rows[0].max_code) + 1);
+}
 
 const UPDATE_WHITELIST = [
     "role", "full_name", "father_name", "national_id", "mobile", "phone", "email", "address",
@@ -209,7 +220,6 @@ const mapRowToPayload = (body = {}, ownerId = null) => {
 const ensureCreatePayload = (payload) => {
     if (!payload.mobile) return "شماره موبایل الزامی است";
     if (!payload.full_name) return "نام و نام خانوادگی الزامی است";
-    if (!payload.member_code) return "کد عضویت الزامی است";
     if (!payload.role) return "نقش کاربر الزامی است";
     return null;
 };
@@ -339,69 +349,8 @@ router.post("/system-users", auth, async (req, res) => {
             return res.status(400).json({ success: false, error: payloadError });
         }
 
-        const r = await pool.query(
-            `INSERT INTO public.members (
-                id, role, full_name, father_name, national_id, mobile, phone, email, address, birth_date,
-                business_name, category, member_status, license_number, license_issue_date, license_expire_date,
-                company_name, registration_number, member_code, permissions, owner_id,
-                member_image, national_card_image, id_card_image, license_image, company_license_image,
-                created_at, updated_at
-            ) VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-                $11,$12,$13,$14,$15,$16,
-                $17,$18,$19,$20,$21,
-                $22,$23,$24,$25,$26,
-                NOW(),NOW()
-            )
-            RETURNING ${MEMBER_SELECT_COLUMNS}`,
-            [
-                payload.id,
-                payload.role,
-                payload.full_name,
-                payload.father_name,
-                payload.national_id,
-                payload.mobile,
-                payload.phone,
-                payload.email,
-                payload.address,
-                payload.birth_date,
-                payload.business_name,
-                payload.category,
-                payload.member_status,
-                payload.license_number,
-                payload.license_issue_date,
-                payload.license_expire_date,
-                payload.company_name,
-                payload.registration_number,
-                payload.member_code,
-                payload.permissions,
-                payload.owner_id,
-                payload.member_image,
-                payload.national_card_image,
-                payload.id_card_image,
-                payload.license_image,
-                payload.company_license_image,
-            ]
-        );
-
-        return res.json({ success: true, data: r.rows[0] });
-    } catch (e) {
-        return sendDbError(res, e, "members/system-users:post");
-    }
-});
-
-// ==========================================
-// 4) ایجاد عضو عمومی
-//    POST /api/members
-// ==========================================
-router.post("/", auth, async (req, res) => {
-    try {
-        const body = req.body || {};
-        const payload = mapRowToPayload(body, null);
-
-        const payloadError = ensureCreatePayload(payload);
-        if (payloadError) {
-            return res.status(400).json({ success: false, error: payloadError });
+        if (!payload.member_code) {
+            payload.member_code = await generateMemberCode();
         }
 
         const r = await pool.query(
@@ -449,9 +398,99 @@ router.post("/", auth, async (req, res) => {
             ]
         );
 
+        if (payload.mobile) {
+            sendSms(payload.mobile, buildWelcomeSms(payload.full_name)).catch(() => {});
+        }
+
+        return res.json({ success: true, data: r.rows[0] });
+    } catch (e) {
+        return sendDbError(res, e, "members/system-users:post");
+    }
+});
+
+// ==========================================
+// 4) ایجاد عضو عمومی
+//    POST /api/members
+// ==========================================
+router.post("/", auth, async (req, res) => {
+    try {
+        const body = req.body || {};
+        const payload = mapRowToPayload(body, null);
+
+        const payloadError = ensureCreatePayload(payload);
+        if (payloadError) {
+            return res.status(400).json({ success: false, error: payloadError });
+        }
+
+        if (!payload.member_code) {
+            payload.member_code = await generateMemberCode();
+        }
+
+        const r = await pool.query(
+            `INSERT INTO public.members (
+                id, role, full_name, father_name, national_id, mobile, phone, email, address, birth_date,
+                business_name, category, member_status, license_number, license_issue_date, license_expire_date,
+                company_name, registration_number, member_code, permissions, owner_id,
+                member_image, national_card_image, id_card_image, license_image, company_license_image,
+                created_at, updated_at
+            ) VALUES (
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                $11,$12,$13,$14,$15,$16,
+                $17,$18,$19,$20,$21,
+                $22,$23,$24,$25,$26,
+                NOW(),NOW()
+            )
+            RETURNING ${MEMBER_SELECT_COLUMNS}`,
+            [
+                payload.id,
+                payload.role,
+                payload.full_name,
+                payload.father_name,
+                payload.national_id,
+                payload.mobile,
+                payload.phone,
+                payload.email,
+                payload.address,
+                payload.birth_date,
+                payload.business_name,
+                payload.category,
+                payload.member_status,
+                payload.license_number,
+                payload.license_issue_date,
+                payload.license_expire_date,
+                payload.company_name,
+                payload.registration_number,
+                payload.member_code,
+                payload.permissions,
+                payload.owner_id,
+                payload.member_image,
+                payload.national_card_image,
+                payload.id_card_image,
+                payload.license_image,
+                payload.company_license_image,
+            ]
+        );
+
+        if (payload.mobile) {
+            sendSms(payload.mobile, buildWelcomeSms(payload.full_name)).catch(() => {});
+        }
+
         return res.json({ success: true, data: r.rows[0] });
     } catch (e) {
         return sendDbError(res, e, "members:post");
+    }
+});
+
+// ==========================================
+// 4.5) دریافت کد عضویت بعدی
+//    GET /api/members/next-code
+// ==========================================
+router.get("/next-code", auth, async (req, res) => {
+    try {
+        const nextCode = await generateMemberCode();
+        return res.json({ success: true, data: { next_code: nextCode } });
+    } catch (e) {
+        return sendDbError(res, e, "members/next-code");
     }
 });
 
@@ -541,10 +580,29 @@ router.put("/:id", auth, updateMemberHandler);
 const deleteMemberHandler = async (req, res) => {
     try {
         const memberId = String(req.params.id || "").trim();
+
+        const deps = [];
+        const checks = [
+            { sql: "SELECT COUNT(*)::int AS cnt FROM receipts WHERE member_id = $1", label: "رسید" },
+            { sql: "SELECT COUNT(*)::int AS cnt FROM clearances WHERE member_id = $1", label: "ترخیص" },
+            { sql: "SELECT COUNT(*)::int AS cnt FROM loading_orders WHERE member_id = $1", label: "بارگیری" },
+            { sql: "SELECT COUNT(*)::int AS cnt FROM warehouse_exits WHERE member_id = $1", label: "خروجی" },
+            { sql: "SELECT COUNT(*)::int AS cnt FROM customers WHERE member_id = $1", label: "مشتری" },
+        ];
+        for (const chk of checks) {
+            const { rows } = await pool.query(chk.sql, [memberId]);
+            if (rows[0]?.cnt > 0) deps.push(`${rows[0].cnt} ${chk.label}`);
+        }
+        if (deps.length > 0) {
+            return res.status(400).json({
+                success: false,
+                error: `امکان حذف وجود ندارد. فرآیندهای زیر برای این عضو ثبت شده: ${deps.join("، ")}`,
+                dependencies: deps,
+            });
+        }
+
         const r = await pool.query(
-            `DELETE FROM public.members
-             WHERE id::text = $1
-             RETURNING id`,
+            `DELETE FROM public.members WHERE id::text = $1 RETURNING id`,
             [memberId]
         );
 

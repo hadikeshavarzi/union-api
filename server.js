@@ -132,8 +132,17 @@ mountRoute('/api/tickets', './api/tickets');
 mountRoute('/api/reports', './api/reports/index');
 mountRoute("/api/members", "./api/members");
 
+// --- Public (QR Code - No Auth) ---
+mountRoute('/api/public', './api/public');
+
 // --- Permissions ---
 mountRoute('/api/permissions', './api/permissions.routes');
+
+// --- SMS Panel (Super Admin Only) ---
+mountRoute('/api/sms-panel', './api/smsPanel');
+
+// --- Opening Balance ---
+mountRoute('/api/opening-balance', './api/openingBalance');
 
 // =======================================
 // Final handlers
@@ -171,6 +180,13 @@ const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log('✅ All Systems Ready');
+
+    try {
+        const { startScheduler } = require("./api/utils/scheduler");
+        startScheduler();
+    } catch (e) {
+        console.error("Scheduler init error:", e.message);
+    }
 });
 
 module.exports = app;

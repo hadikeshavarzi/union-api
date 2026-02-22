@@ -275,6 +275,25 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     const { id } = req.params;
     if (!isUUID(id)) return res.status(400).json({ success: false, error: "شناسه نامعتبر" });
 
+    const deps = [];
+    const depChecks = [
+      { sql: "SELECT COUNT(*)::int AS cnt FROM receipt_items WHERE product_id = $1", label: "ردیف رسید" },
+      { sql: "SELECT COUNT(*)::int AS cnt FROM clearance_items WHERE product_id = $1", label: "ردیف ترخیص" },
+      { sql: "SELECT COUNT(*)::int AS cnt FROM inventory_transactions WHERE product_id = $1 AND member_id = $2", label: "تراکنش انبار" },
+    ];
+    for (const chk of depChecks) {
+      const params = chk.sql.includes("$2") ? [id, memberId] : [id];
+      const { rows } = await pool.query(chk.sql, params);
+      if (rows[0]?.cnt > 0) deps.push(`${rows[0].cnt} ${chk.label}`);
+    }
+    if (deps.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: `امکان حذف وجود ندارد. این کالا در فرآیندهای زیر استفاده شده: ${deps.join("، ")}`,
+        dependencies: deps,
+      });
+    }
+
     const result = await pool.query("DELETE FROM public.products WHERE id = $1 AND member_id = $2", [id, memberId]);
     if (result.rowCount === 0) return res.status(404).json({ success: false, error: "کالا یافت نشد" });
 

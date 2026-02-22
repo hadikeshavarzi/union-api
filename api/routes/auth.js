@@ -1,6 +1,7 @@
 // api/routes/auth.js
 const express = require("express");
 const jwt = require("jsonwebtoken");
+const axios = require("axios");
 const { pool } = require("../../supabaseAdmin");
 const authMiddleware = require("../middleware/auth");
 
@@ -44,7 +45,27 @@ router.post("/request-otp", async (req, res) => {
             [otp, cleanMobile]
         );
 
-        console.log(`📨 OTP for ${cleanMobile}: ${otp}`); // نمایش در کنسول سرور برای تست
+        console.log(`📨 OTP for ${cleanMobile}: ${otp}`);
+
+        const smsUser = process.env.MELIPAYAMAK_USERNAME;
+        const smsPass = process.env.MELIPAYAMAK_PASSWORD;
+        const smsFrom = process.env.SMS_SENDER_NUMBER;
+        if (smsUser && smsPass && smsFrom) {
+            try {
+                const smsResp = await axios.post("https://rest.payamak-panel.com/api/SendSMS/SendSMS", {
+                    username: smsUser,
+                    password: smsPass,
+                    to: cleanMobile,
+                    from: smsFrom,
+                    text: `سامانه مدیریت انبار\nکد ورود شما: ${otp}`,
+                    isflash: false,
+                }, { timeout: 15000, proxy: false });
+                console.log(`✅ SMS sent to ${cleanMobile}:`, JSON.stringify(smsResp.data));
+            } catch (smsErr) {
+                console.error(`❌ SMS Error for ${cleanMobile}:`, smsErr.response?.data || smsErr.message);
+            }
+        }
+
         res.json({ success: true, message: "کد تایید ارسال شد" });
 
     } catch (error) {

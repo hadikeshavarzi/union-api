@@ -378,16 +378,50 @@ router.get("/journal", authMiddleware, async (req, res) => {
 router.get("/kardex", authMiddleware, async (req, res) => {
     try {
         const member_id = req.user.member_id;
-        const { product_id, owner_id, date_from, date_to } = req.query;
+        const { product_id, owner_id, date_from, date_to, show_pending } = req.query;
 
         if (!product_id) {
             return res.status(400).json({ success: false, error: "product_id الزامی است" });
         }
 
+        const params = [member_id, product_id];
+
+        // Base filter: receipts (in/havaleh + opening_balance) + physical exits (type='exit')
+        let typeFilter = `(
+            (it.type = 'in' AND it.transaction_type IN ('havaleh','opening_balance'))
+            OR it.type = 'exit'
+        )`;
+
+        if (show_pending === 'true') {
+            typeFilter = `(
+                (it.type = 'in' AND it.transaction_type IN ('havaleh','opening_balance'))
+                OR it.type = 'exit'
+                OR (
+                    it.type = 'out' AND it.transaction_type = 'clearance'
+                    AND it.parent_batch_no IS NOT NULL
+                    AND it.parent_batch_no != ''
+                    AND EXISTS (
+                        SELECT 1 FROM public.inventory_transactions r
+                        WHERE r.type = 'in' AND r.transaction_type IN ('havaleh','opening_balance')
+                          AND r.batch_no = it.parent_batch_no
+                          AND r.product_id = it.product_id
+                          AND r.member_id = it.member_id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM public.inventory_transactions ex
+                        WHERE ex.type = 'exit'
+                          AND ex.batch_no = it.batch_no
+                          AND ex.product_id = it.product_id
+                          AND ex.member_id = it.member_id
+                    )
+                )
+            )`;
+        }
+
         let query = `
             SELECT
                 it.id, it.type, it.transaction_type, it.qty, it.weight,
-                it.batch_no, it.transaction_date, it.description,
+                it.batch_no, it.parent_batch_no, it.transaction_date, it.description,
                 it.ref_receipt_id, it.ref_clearance_id, it.ref_exit_id,
                 p.name AS product_name,
                 c.name AS owner_name
@@ -395,8 +429,8 @@ router.get("/kardex", authMiddleware, async (req, res) => {
             LEFT JOIN public.products p ON it.product_id = p.id
             LEFT JOIN public.customers c ON it.owner_id = c.id
             WHERE it.member_id = $1 AND it.product_id = $2
+              AND ${typeFilter}
         `;
-        const params = [member_id, product_id];
 
         if (owner_id) {
             params.push(owner_id);
@@ -417,8 +451,8 @@ router.get("/kardex", authMiddleware, async (req, res) => {
 
         let runQty = 0, runWeight = 0;
         const result = rows.map(row => {
-            const q = Number(row.qty) || 0;
-            const w = Number(row.weight) || 0;
+            const q = Math.abs(Number(row.qty) || 0);
+            const w = Math.abs(Number(row.weight) || 0);
             if (row.type === 'in') { runQty += q; runWeight += w; }
             else { runQty -= q; runWeight -= w; }
 
@@ -453,20 +487,24 @@ router.get("/stock-list", authMiddleware, async (req, res) => {
             SELECT
                 it.product_id,
                 it.owner_id,
-                it.batch_no,
-                it.parent_batch_no,
                 p.name AS product_name,
                 c.name AS owner_name,
-                SUM(CASE WHEN it.type = 'in' THEN it.qty ELSE 0 END) AS total_in_qty,
-                SUM(CASE WHEN it.type = 'out' THEN it.qty ELSE 0 END) AS total_out_qty,
-                SUM(CASE WHEN it.type = 'in' THEN it.weight ELSE 0 END) AS total_in_weight,
-                SUM(CASE WHEN it.type = 'out' THEN it.weight ELSE 0 END) AS total_out_weight,
-                SUM(CASE WHEN it.type = 'in' THEN it.qty ELSE -it.qty END) AS actual_qty,
-                SUM(CASE WHEN it.type = 'in' THEN it.weight ELSE -it.weight END) AS actual_weight
+                SUM(CASE WHEN it.type = 'in' THEN ABS(it.qty) ELSE 0 END) AS total_in_qty,
+                SUM(CASE WHEN it.type = 'exit' THEN ABS(it.qty) ELSE 0 END) AS total_out_qty,
+                SUM(CASE WHEN it.type = 'in' THEN ABS(it.weight) ELSE 0 END) AS total_in_weight,
+                SUM(CASE WHEN it.type = 'exit' THEN ABS(it.weight) ELSE 0 END) AS total_out_weight,
+                SUM(CASE WHEN it.type = 'in' THEN ABS(it.qty) ELSE 0 END) -
+                    SUM(CASE WHEN it.type = 'exit' THEN ABS(it.qty) ELSE 0 END) AS actual_qty,
+                SUM(CASE WHEN it.type = 'in' THEN ABS(it.weight) ELSE 0 END) -
+                    SUM(CASE WHEN it.type = 'exit' THEN ABS(it.weight) ELSE 0 END) AS actual_weight
             FROM public.inventory_transactions it
             LEFT JOIN public.products p ON it.product_id = p.id
             LEFT JOIN public.customers c ON it.owner_id = c.id
             WHERE it.member_id = $1
+              AND (
+                (it.type = 'in' AND it.transaction_type IN ('havaleh','opening_balance'))
+                OR it.type = 'exit'
+              )
         `;
         const params = [member_id];
 
@@ -481,27 +519,43 @@ router.get("/stock-list", authMiddleware, async (req, res) => {
         if (search) {
             params.push(`%${search}%`);
             const idx = params.length;
-            query += ` AND (p.name ILIKE $${idx} OR c.name ILIKE $${idx} OR COALESCE(it.batch_no,'') ILIKE $${idx} OR COALESCE(it.parent_batch_no,'') ILIKE $${idx})`;
+            query += ` AND (p.name ILIKE $${idx} OR c.name ILIKE $${idx} OR COALESCE(it.batch_no,'') ILIKE $${idx})`;
         }
 
-        query += ` GROUP BY it.product_id, it.owner_id, it.batch_no, it.parent_batch_no, p.name, c.name ORDER BY c.name ASC NULLS LAST, p.name ASC, it.batch_no ASC`;
+        query += ` GROUP BY it.product_id, it.owner_id, p.name, c.name ORDER BY c.name ASC NULLS LAST, p.name ASC`;
 
         const { rows } = await pool.query(query, params);
 
         let pendingMap = {};
         if (stockFilter === 'available') {
             const pendingParams = [member_id];
-            let pendingWhere = 'WHERE member_id = $1 AND type = \'out\' AND transaction_type = \'clearance\'';
+            let pendingWhere = `
+                WHERE it2.member_id = $1
+                  AND it2.type = 'out' AND it2.transaction_type = 'clearance'
+                  AND it2.parent_batch_no IS NOT NULL AND it2.parent_batch_no != ''
+                  AND EXISTS (
+                    SELECT 1 FROM public.inventory_transactions r
+                    WHERE r.type = 'in' AND r.transaction_type IN ('havaleh','opening_balance')
+                      AND r.batch_no = it2.parent_batch_no
+                      AND r.product_id = it2.product_id AND r.member_id = it2.member_id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM public.inventory_transactions ex
+                    WHERE ex.type = 'exit'
+                      AND ex.batch_no = it2.batch_no
+                      AND ex.product_id = it2.product_id AND ex.member_id = it2.member_id
+                  )
+            `;
             if (owner_id) {
                 pendingParams.push(owner_id);
-                pendingWhere += ` AND owner_id = $${pendingParams.length}`;
+                pendingWhere += ` AND it2.owner_id = $${pendingParams.length}`;
             }
             const pendingSql = `
-                SELECT product_id, owner_id,
-                    SUM(qty) AS pending_qty, SUM(weight) AS pending_weight
-                FROM public.inventory_transactions
+                SELECT it2.product_id, it2.owner_id,
+                    SUM(ABS(it2.qty)) AS pending_qty, SUM(ABS(it2.weight)) AS pending_weight
+                FROM public.inventory_transactions it2
                 ${pendingWhere}
-                GROUP BY product_id, owner_id
+                GROUP BY it2.product_id, it2.owner_id
             `;
             const { rows: pendingRows } = await pool.query(pendingSql, pendingParams);
             pendingRows.forEach(r => {
@@ -521,8 +575,6 @@ router.get("/stock-list", authMiddleware, async (req, res) => {
             return {
                 product_id: row.product_id,
                 owner_id: row.owner_id,
-                batch_no: row.batch_no || '',
-                parent_row: row.parent_batch_no || '',
                 product_name: row.product_name,
                 owner_name: row.owner_name,
                 total_in_qty: Number(row.total_in_qty) || 0,

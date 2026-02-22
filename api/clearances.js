@@ -2,6 +2,7 @@
 const express = require("express");
 const { pool } = require("../supabaseAdmin");
 const authMiddleware = require("./middleware/auth");
+const { sendClearanceSms } = require("./utils/sms");
 
 const router = express.Router();
 
@@ -10,14 +11,12 @@ function toNumber(v) {
     return Number.isFinite(n) ? n : 0;
 }
 
-async function generateClearanceNo(memberId) {
-    try {
-        const res = await pool.query("SELECT count(*) as count FROM clearances WHERE member_id = $1", [memberId]);
-        const count = parseInt(res.rows[0].count);
-        return 10000 + (count + 1);
-    } catch (err) {
-        throw new Error("خطا در تولید شماره سند");
-    }
+async function generateClearanceNo(client, memberId) {
+    const res = await client.query(
+        "SELECT COALESCE(MAX(clearance_no::bigint), 10000) AS max_no FROM clearances WHERE member_id = $1",
+        [memberId]
+    );
+    return (Number(res.rows[0].max_no) + 1).toString();
 }
 
 /* ============================================================
@@ -376,7 +375,7 @@ router.post("/", authMiddleware, async (req, res) => {
             throw new Error("اطلاعات ناقص است");
         }
 
-        const clearanceNo = await generateClearanceNo(member_id);
+        const clearanceNo = await generateClearanceNo(client, member_id);
 
         let pRight='', pMid='', pLet='', pLeft='';
         const plateStr = (plate && typeof plate === 'object') ? plate.plate_number : plate;
@@ -472,6 +471,21 @@ router.post("/", authMiddleware, async (req, res) => {
 
         await client.query('COMMIT');
         res.json({ success: true, clearance_no: clearanceNo, id: clearanceId, message: "ثبت شد" });
+
+        const smsItems = items.map(it => ({
+            productName: it.product_name || it.productName || "",
+            qty: it.qty || 0,
+            weight: it.weight || 0,
+            batchNo: it.parent_batch_no || "",
+        }));
+        const plateDisplay = [pLeft, pLet, pMid, pRight].filter(Boolean).join("-");
+        sendClearanceSms({
+            memberId: member_id, customerId: customer_id,
+            items: smsItems,
+            receiverName: receiver_person_name,
+            receiverNationalId: receiver_person_national_id,
+            plate: plateDisplay,
+        }).catch(e => console.error("Clearance SMS error:", e.message));
 
     } catch (e) {
         await client.query('ROLLBACK');
@@ -605,7 +619,11 @@ router.delete("/:id", authMiddleware, async (req, res) => {
         );
         if (loadedItems.length > 0) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: "این حواله قبلاً بارگیری شده و قابل حذف نیست" });
+            return res.status(400).json({
+                success: false,
+                error: "امکان حذف وجود ندارد. برای این ترخیص، بارگیری صادر شده است. ابتدا بارگیری مربوطه را حذف کنید.",
+                dependencies: ["بارگیری"],
+            });
         }
 
         // حذف تراکنش‌های مرتبط

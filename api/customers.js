@@ -319,6 +319,25 @@ router.delete(
         return res.status(404).json({ success: false, error: "مشتری یافت نشد" });
       }
 
+      const deps = [];
+      const depChecks = [
+        { sql: "SELECT COUNT(*)::int AS cnt FROM receipts WHERE owner_id = $1 AND member_id = $2", label: "رسید" },
+        { sql: "SELECT COUNT(*)::int AS cnt FROM clearances WHERE customer_id = $1 AND member_id = $2", label: "ترخیص" },
+        { sql: "SELECT COUNT(*)::int AS cnt FROM inventory_transactions WHERE owner_id = $1 AND member_id = $2", label: "تراکنش انبار" },
+      ];
+      for (const chk of depChecks) {
+        const { rows } = await client.query(chk.sql, [id, member_id]);
+        if (rows[0]?.cnt > 0) deps.push(`${rows[0].cnt} ${chk.label}`);
+      }
+      if (deps.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          error: `امکان حذف وجود ندارد. فرآیندهای زیر برای این مشتری ثبت شده: ${deps.join("، ")}`,
+          dependencies: deps,
+        });
+      }
+
       const { tafsili_id } = findRes.rows[0];
 
       await client.query("DELETE FROM public.customers WHERE id = $1 AND member_id = $2", [id, member_id]);

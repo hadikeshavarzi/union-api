@@ -1,8 +1,8 @@
 // api/exits.js (Converted to PostgreSQL)
 const express = require("express");
-const { pool } = require("../supabaseAdmin"); // استفاده از pool به جای supabaseAdmin
-// حذف یکی از نقاط چون نیازی به برگشت به پوشه قبل نیست
+const { pool } = require("../supabaseAdmin");
 const authMiddleware = require("./middleware/auth");
+const { sendExitSms } = require("./utils/sms");
 const router = express.Router();
 
 /* ============================================================
@@ -355,12 +355,27 @@ router.post("/", authMiddleware, async (req, res) => {
             await client.query(`UPDATE public.loading_orders SET status = 'exited' WHERE id = $1`, [payload.loading_order_id]);
         }
 
-        await client.query('COMMIT'); // ✅ پایان موفق
+        await client.query('COMMIT');
 
-        return res.json({ success: true, id: header.id, exit_no: header.exit_no, message: "خروج با موفقیت ثبت شد" });
+        res.json({ success: true, id: header.id, exit_no: header.exit_no, message: "خروج با موفقیت ثبت شد" });
+
+        if (payload.status === "final" && payload.owner_id) {
+            const smsItems = (payload.items || []).map(it => ({
+                productName: it.product_name || it.productName || "",
+                qty: it.qty || 0,
+                weight: it.weight || 0,
+                batchNo: it.batch_no || "",
+            }));
+            sendExitSms({
+                memberId, exitNo: header.exit_no, customerId: payload.owner_id,
+                items: smsItems, docDate: payload.exit_date,
+            }).catch(e => console.error("SMS error:", e.message));
+        }
+
+        return;
 
     } catch (e) {
-        await client.query('ROLLBACK'); // ❌ بازگشت در صورت خطا
+        await client.query('ROLLBACK');
         console.error("❌ Post Exit Error:", e.message);
         return res.status(500).json({ success: false, error: e.message });
     } finally {

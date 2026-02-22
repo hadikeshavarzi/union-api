@@ -342,7 +342,11 @@ router.delete("/:id", authMiddleware, async (req, res) => {
         );
         if (exitRows.length) {
             await client.query('ROLLBACK');
-            return res.status(400).json({ success: false, error: "این دستور خروج شده و قابل حذف نیست" });
+            return res.status(400).json({
+                success: false,
+                error: "امکان حذف وجود ندارد. برای این بارگیری، سند خروج صادر شده است. ابتدا سند خروج مربوطه را حذف کنید.",
+                dependencies: ["خروجی"],
+            });
         }
 
         // ۱. حذف تراکنش‌های مرتبط
