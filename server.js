@@ -144,6 +144,9 @@ mountRoute('/api/sms-panel', './api/smsPanel');
 // --- Opening Balance ---
 mountRoute('/api/opening-balance', './api/openingBalance');
 
+// --- NWMS (سامانه جامع انبارها) ---
+mountRoute('/api/nwms', './api/nwms');
+
 // =======================================
 // Final handlers
 // =======================================

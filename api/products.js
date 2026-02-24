@@ -149,8 +149,10 @@ router.post("/", authMiddleware, async (req, res) => {
       (member_id, owner_id, name, sku, category_id, unit_id,
        min_stock, max_stock, location, price, cost_price,
        description, specifications, barcode, batch_number, expire_date,
-       is_active, notes, national_id, national_title, created_at, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NOW(),NOW())
+       is_active, notes, national_id, national_title,
+       nwms_good_id, nwms_measurement_unit, nwms_production_type,
+       created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW(),NOW())
       RETURNING id
     `;
 
@@ -161,6 +163,7 @@ router.post("/", authMiddleware, async (req, res) => {
       b.description || null, b.specifications || null, b.barcode || null,
       b.batch_number || null, toDateOrNull(b.expire_date),
       toBool(b.is_active) ?? true, b.notes || null, b.national_id || null, b.national_title || null,
+      b.nwms_good_id || null, b.nwms_measurement_unit || null, b.nwms_production_type || '1',
     ];
 
     const ins = await client.query(insertSql, values);
@@ -220,8 +223,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
         description = $10, specifications = $11, barcode = $12,
         batch_number = $13, expire_date = $14,
         is_active = $15, notes = $16, national_id = $17, national_title = $18,
+        nwms_good_id = $19, nwms_measurement_unit = $20, nwms_production_type = $21,
         updated_at = NOW()
-      WHERE id = $19 AND member_id = $20
+      WHERE id = $22 AND member_id = $23
       RETURNING id
     `;
 
@@ -241,6 +245,9 @@ router.put("/:id", authMiddleware, async (req, res) => {
       b.notes !== undefined ? (b.notes || null) : old.notes,
       b.national_id !== undefined ? (b.national_id || null) : old.national_id,
       b.national_title !== undefined ? (b.national_title || null) : old.national_title,
+      b.nwms_good_id !== undefined ? (b.nwms_good_id || null) : old.nwms_good_id,
+      b.nwms_measurement_unit !== undefined ? (b.nwms_measurement_unit || null) : old.nwms_measurement_unit,
+      b.nwms_production_type !== undefined ? (b.nwms_production_type || '1') : (old.nwms_production_type || '1'),
       id, memberId,
     ];
 
